@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ArrowDownToLine,
   ArrowUpFromLine,
@@ -60,7 +60,26 @@ export default function Inventory() {
   const [status, setStatus] = useState("In shop");
   const [search, setSearch] = useState("");
   const [notice, setNotice] = useState("");
-  const [devices, setDevices] = useState(initialDevices);
+  const [devices, setDevices] = useState<DeviceRecord[]>(() => {
+  try {
+    const savedDevices = localStorage.getItem("stockpilot-inventory");
+
+    if (savedDevices) {
+      return JSON.parse(savedDevices) as DeviceRecord[];
+    }
+  } catch (error) {
+    console.error("Could not load saved inventory:", error);
+  }
+
+  return initialDevices;
+});
+useEffect(() => {
+  try {
+    localStorage.setItem("stockpilot-inventory", JSON.stringify(devices));
+  } catch (error) {
+    console.error("Could not save inventory:", error);
+  }
+}, [devices]);
 
   const setIdentifier = useCallback((value: string) => {
     if (targetField === "imei1") setImei1(value);
