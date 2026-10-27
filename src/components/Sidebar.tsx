@@ -8,6 +8,7 @@ import {
   Settings2,
   Smartphone,
   Users,
+  WalletCards,
   Wrench,
   X,
 } from "lucide-react";
@@ -20,6 +21,7 @@ export type PageKey =
   | "Repairs"
   | "Daily closing"
   | "Reports"
+  | "Suppliers & credit"
   | "Team & shops"
   | "Settings";
 
@@ -38,6 +40,7 @@ const primaryItems = [
   { label: "Repairs", icon: Wrench },
   { label: "Daily closing", icon: ClipboardCheck },
   { label: "Reports", icon: BarChart3 },
+  { label: "Suppliers & credit", icon: WalletCards },
 ] as const;
 
 export default function Sidebar({

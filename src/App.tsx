@@ -10,17 +10,8 @@ import {
 } from "lucide-react";
 import Sidebar, { type PageKey } from "./components/Sidebar";
 import Overview from "./pages/Overview";
-
-const placeholderCopy: Record<Exclude<PageKey, "Overview">, { title: string; description: string }> = {
-  Inventory: { title: "Inventory", description: "Search devices, check approved selling prices and track stock status." },
-  Sales: { title: "Sales", description: "Record sales, returns, payment methods and outstanding customer balances." },
-  Custody: { title: "Custody ledger", description: "Track phones entrusted to middle-men and follow up on outstanding items." },
-  Repairs: { title: "Repair tracking", description: "Follow devices sent to mechanics, repair costs and return status." },
-  "Daily closing": { title: "Daily closing", description: "Reconcile expected cash against the actual count and review discrepancies." },
-  Reports: { title: "Reports", description: "Review stock valuation, sales, expenses and operational summaries." },
-  "Team & shops": { title: "Team & shops", description: "Manage staff roles and, in a later release, multiple shop workspaces." },
-  Settings: { title: "Settings", description: "Configure shop preferences, appearance and account settings." },
-};
+import Inventory from "./pages/Inventory";
+import Operations from "./pages/Operations";
 
 export default function App() {
   const [activePage, setActivePage] = useState<PageKey>("Overview");
@@ -76,18 +67,10 @@ export default function App() {
 
         {activePage === "Overview" ? (
           <Overview onNavigate={navigate} />
+        ) : activePage === "Inventory" ? (
+          <Inventory />
         ) : (
-          <section className="placeholder-page page-content">
-            <div className="eyebrow"><span className="eyebrow-line" /> STOCKPILOT WORKSPACE</div>
-            <h1>{placeholderCopy[activePage].title}</h1>
-            <p className="page-subtitle">{placeholderCopy[activePage].description}</p>
-            <div className="placeholder-card surface-card">
-              <div className="placeholder-icon"><Command size={22} /></div>
-              <h2>This module is scheduled for the next build stage.</h2>
-              <p>Navigation and layout are connected. We'll implement the real workflow here, using fictional data until authentication and backend security are in place.</p>
-              <button className="button button-primary" onClick={() => setActivePage("Overview")}>Return to overview</button>
-            </div>
-          </section>
+          <Operations key={activePage} page={activePage} />
         )}
       </main>
     </div>
