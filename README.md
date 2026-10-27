@@ -1,10 +1,12 @@
-# StockPilot
+# StockPilot (working name)
 
-StockPilot is a responsive retail operations app for small phone and gadget shops.
+A responsive frontend prototype for small phone and gadget retailers. The public brand name is still being reviewed.
 
 ## Current milestone
 
-This repository currently contains a frontend prototype with fictional demonstration data. It does not yet provide real authentication, a backend, durable business records, or secure multi-user access.
+This project includes a dashboard, a serialized device inventory prototype, browser camera barcode/QR scanning, and demo UI flows for sales/POS, custody, repairs, daily closing, reports, supplier credit/customer layaway, team/branches, and settings.
+
+**Important:** these are frontend prototypes with fictional demonstration data. They are not a production-ready retail system. Records are kept in page state and disappear when the page refreshes. There is no live authentication, database, real role enforcement, actual payment processing, PDF/WhatsApp/SMS delivery, verified model catalogue, OCR for printed text, PWA/offline sync, or production audit trail yet.
 
 ## Requirements
 
@@ -13,7 +15,7 @@ This repository currently contains a frontend prototype with fictional demonstra
 - Visual Studio Code
 - Chrome or another modern browser
 
-Check your versions:
+Check versions:
 
 ```bash
 node --version
@@ -35,33 +37,32 @@ Open the local URL printed by Vite, usually `http://localhost:5173`.
 npm run build
 ```
 
-## Test on a phone on the same Wi-Fi
+The updated project archive has not been build-verified in this environment because dependency installation timed out. Run the build locally and share any error output so we can fix it.
 
-1. Start Vite with `npm run dev -- --host 0.0.0.0`.
-2. Find your laptop's local IPv4 address.
-3. On your phone, connected to the same Wi-Fi, open `http://YOUR-LAPTOP-IP:5173`.
-4. If it does not load, check your laptop firewall and Wi-Fi network isolation settings.
+## Camera scanner
 
-Do not expose this development server to public networks.
+The inventory scanner uses `@zxing/browser` to read supported barcodes and QR codes using a camera. The user must grant camera permission. Browsers generally require HTTPS or a trusted local context such as `http://localhost`; plain HTTP over a laptop's local Wi-Fi IP may block camera access. The scanner does not read plain printed IMEI text (OCR) or prove that a device is genuine. Manual entry remains available.
 
-## Project structure
+Model identification is optional. A model/part-number field accepts values such as `MG6C4AH/A`, but a real catalogue lookup is not connected yet. Users can manually enter model details if a code is unavailable, unknown, or the internet is slow.
 
-```text
-stockpilot/
-├── public/
-├── src/
-│   ├── components/
-│   ├── data/
-│   ├── pages/
-│   ├── styles/
-│   ├── App.tsx
-│   └── main.tsx
-├── .env.example
-├── index.html
-├── package.json
-└── README.md
-```
+## MVP roadmap
 
-## Security roadmap
+1. Serialized IMEI intake and inventory view.
+2. Camera barcode/QR scanning and quick checkout.
+3. PDF receipts and WhatsApp/SMS sharing.
+4. Daily sales and profit reporting.
 
-The next stages will integrate Supabase Auth, PostgreSQL Row Level Security, shop membership/roles, protected logo uploads, audit history and tested offline synchronization. The frontend alone must never be treated as a security boundary.
+The screens for the six core modules are scaffolds to help define and test the workflows. They need persistent data and business rules before real shop use.
+
+## Security and data correctness roadmap
+
+- Supabase Auth + PostgreSQL Row Level Security and shop membership.
+- Backend-enforced owner/admin/attendant permissions; never rely on frontend hiding alone for cost-price protection.
+- Device-level unique identifier constraints and a full identifier history.
+- Append-only audit events and server-side transaction rules.
+- Branch transfers with request, in-transit and received states.
+- Supplier payable and customer installment ledgers.
+- Tested local persistence and offline synchronization with idempotency/conflict handling.
+- Private storage for shop logos and server-side subscription plan enforcement.
+
+Do not enter real customer details, real IMEIs or financial data into this demo. Use fictional identifiers while testing.
