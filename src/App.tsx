@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 import {
   Bell,
   ChevronDown,
@@ -9,10 +9,10 @@ import {
   Sun,
 } from "lucide-react";
 import Sidebar, { type PageKey } from "./components/Sidebar";
-import Overview from "./pages/Overview";
-import Inventory from "./pages/Inventory";
-import Operations from "./pages/Operations";
-
+const Overview = lazy(() => import("./pages/Overview"));
+const Inventory = lazy(() => import("./pages/Inventory"));
+const Sales = lazy(() => import("./pages/sales"));
+const Operations = lazy(() => import("./pages/Operations"));
 export default function App() {
   const [activePage, setActivePage] = useState<PageKey>("Overview");
   const [darkMode, setDarkMode] = useState(true);
@@ -65,13 +65,17 @@ export default function App() {
           </div>
         </header>
 
-        {activePage === "Overview" ? (
-          <Overview onNavigate={navigate} />
-        ) : activePage === "Inventory" ? (
-          <Inventory />
-        ) : (
-          <Operations key={activePage} page={activePage} />
-        )}
+  <Suspense fallback={<div className="page-loading">Loading page...</div>}>
+    {activePage === "Overview" ? (
+      <Overview onNavigate={navigate} />
+    ) : activePage === "Inventory" ? (
+      <Inventory />
+    ) : activePage === "Sales" ? (
+      <Sales />
+    ) : (
+      <Operations key={activePage} page={activePage} />
+    )}
+  </Suspense>
       </main>
     </div>
   );
