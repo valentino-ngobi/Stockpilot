@@ -11,6 +11,18 @@ import {
   Wallet,
 } from "lucide-react";
 
+import {
+  CURRENCY_OPTIONS,
+  convertToSnapshotCurrency,
+  formatCurrency,
+  getRecordCurrency,
+  getSavedExchangeRateSnapshot,
+  getShopCurrency,
+  refreshExchangeRateSnapshot,
+  type CurrencyCode,
+  type ExchangeRateSnapshot,
+} from "../utils/currency";
+
 type CreditType = "Payable" | "Receivable";
 
 type CreditPayment = {
@@ -27,9 +39,16 @@ type CreditRecord = {
   reference: string;
   description: string;
   originalAmount: number;
+  currencyCode?: CurrencyCode;
   dueDate: string;
   createdAt: string;
   payments: CreditPayment[];
+  purchaseId?: string;
+};
+
+type ConvertedTotal = {
+  amount: number;
+  missingCurrencies: CurrencyCode[];
 };
 
 const STORAGE_KEY = "stockpilot-credit-records";
@@ -40,18 +59,20 @@ function readRecords(): CreditRecord[] {
     if (!saved) return [];
 
     const parsed: unknown = JSON.parse(saved);
-    return Array.isArray(parsed) ? (parsed as CreditRecord[]) : [];
+
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed.map((record) => ({
+      ...record,
+      payments: Array.isArray(record.payments) ? record.payments : [],
+    })) as CreditRecord[];
   } catch {
     return [];
   }
 }
 
-function formatMoney(amount: number) {
-  return new Intl.NumberFormat("en-UG", {
-    style: "currency",
-    currency: "UGX",
-    maximumFractionDigits: 0,
-  }).format(Number.isFinite(amount) ? amount : 0);
+function getCurrency(record: CreditRecord): CurrencyCode {
+  return getRecordCurrency(record.currencyCode);
 }
 
 function getPaidAmount(record: CreditRecord) {
@@ -95,11 +116,70 @@ function formatDate(date: string) {
   });
 }
 
+function getConvertedTotal(
+  records: CreditRecord[],
+  type: CreditType,
+  baseCurrency: CurrencyCode,
+  snapshot: ExchangeRateSnapshot | null
+): ConvertedTotal {
+  let total = 0;
+  const missingCurrencies = new Set<CurrencyCode>();
+
+  records
+    .filter((record) => record.type === type)
+    .forEach((record) => {
+      const balance = getBalance(record);
+
+      if (balance <= 0) return;
+
+      const recordCurrency = getCurrency(record);
+
+      if (recordCurrency === baseCurrency) {
+        total += balance;
+        return;
+      }
+
+      if (!snapshot || snapshot.baseCode !== baseCurrency) {
+        missingCurrencies.add(recordCurrency);
+        return;
+      }
+
+      const converted = convertToSnapshotCurrency(
+        balance,
+        recordCurrency,
+        snapshot
+      );
+
+      if (converted === null) {
+        missingCurrencies.add(recordCurrency);
+        return;
+      }
+
+      total += converted;
+    });
+
+  return {
+    amount: total,
+    missingCurrencies: Array.from(missingCurrencies).sort(),
+  };
+}
+
 export default function SupplierCredit() {
   const [records, setRecords] = useState<CreditRecord[]>(readRecords);
   const [activeTab, setActiveTab] = useState<"All" | CreditType>("All");
   const [showForm, setShowForm] = useState(false);
   const [notice, setNotice] = useState("");
+
+  const [shopCurrency] = useState<CurrencyCode>(() => getShopCurrency());
+
+  const [exchangeSnapshot, setExchangeSnapshot] =
+    useState<ExchangeRateSnapshot | null>(() =>
+      getSavedExchangeRateSnapshot(getShopCurrency())
+    );
+
+  const [rateMessage, setRateMessage] = useState(
+    "Loading the latest exchange rates..."
+  );
 
   const [type, setType] = useState<CreditType>("Payable");
   const [party, setParty] = useState("");
@@ -107,12 +187,16 @@ export default function SupplierCredit() {
   const [reference, setReference] = useState("");
   const [description, setDescription] = useState("");
   const [amount, setAmount] = useState("");
+  const [currencyCode, setCurrencyCode] = useState<CurrencyCode>(
+    getShopCurrency()
+  );
   const [dueDate, setDueDate] = useState("");
 
   const [paymentRecordId, setPaymentRecordId] = useState("");
   const [paymentAmount, setPaymentAmount] = useState("");
   const [paymentDate, setPaymentDate] = useState(getToday());
 
+  // Keep the ledger in sync with purchases and other browser tabs.
   useEffect(() => {
     const refresh = () => setRecords(readRecords());
 
@@ -125,29 +209,89 @@ export default function SupplierCredit() {
     };
   }, []);
 
+  // Automatically request fresh exchange rates whenever this page opens.
+  useEffect(() => {
+    let cancelled = false;
+
+    const savedSnapshot = getSavedExchangeRateSnapshot(shopCurrency);
+
+    if (savedSnapshot) {
+      setExchangeSnapshot(savedSnapshot);
+      setRateMessage("Saved exchange rates available. Refreshing rates...");
+    }
+
+    const fetchRates = async () => {
+      try {
+        const freshSnapshot =
+          await refreshExchangeRateSnapshot(shopCurrency);
+
+        if (cancelled) return;
+
+        setExchangeSnapshot(freshSnapshot);
+
+        const updatedDate = new Date(
+          freshSnapshot.lastUpdatedAt
+        ).toLocaleString();
+
+        setRateMessage(
+          `Exchange rates refreshed. Provider's last update: ${updatedDate}.`
+        );
+      } catch (error) {
+        if (cancelled) return;
+
+        console.error("Could not refresh exchange rates:", error);
+
+        if (savedSnapshot) {
+          setExchangeSnapshot(savedSnapshot);
+          setRateMessage(
+            "Could not refresh exchange rates. Using the last successfully saved rates."
+          );
+        } else {
+          setRateMessage(
+            "Exchange rates are unavailable. Only balances already in the shop currency can be included in the summary."
+          );
+        }
+      }
+    };
+
+    void fetchRates();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [shopCurrency]);
+
   const saveRecords = (updated: CreditRecord[]) => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
-    setRecords(updated);
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
+      setRecords(updated);
+    } catch {
+      setNotice(
+        "Could not save credit records. Check available browser storage."
+      );
+    }
   };
 
   const totals = useMemo(() => {
-    const payables = records.filter((record) => record.type === "Payable");
-    const receivables = records.filter(
-      (record) => record.type === "Receivable"
-    );
-
     return {
-      payable: payables.reduce((sum, record) => sum + getBalance(record), 0),
-      receivable: receivables.reduce(
-        (sum, record) => sum + getBalance(record),
-        0
+      payables: getConvertedTotal(
+        records,
+        "Payable",
+        shopCurrency,
+        exchangeSnapshot
+      ),
+      receivables: getConvertedTotal(
+        records,
+        "Receivable",
+        shopCurrency,
+        exchangeSnapshot
       ),
       overdue: records.filter(
         (record) => getStatus(record) === "Overdue"
       ).length,
       open: records.filter((record) => getBalance(record) > 0).length,
     };
-  }, [records]);
+  }, [records, shopCurrency, exchangeSnapshot]);
 
   const visibleRecords = useMemo(() => {
     return records
@@ -180,6 +324,7 @@ export default function SupplierCredit() {
       reference: reference.trim(),
       description: description.trim(),
       originalAmount: parsedAmount,
+      currencyCode,
       dueDate,
       createdAt: new Date().toISOString(),
       payments: [],
@@ -193,6 +338,7 @@ export default function SupplierCredit() {
     setDescription("");
     setAmount("");
     setDueDate("");
+    setCurrencyCode(getShopCurrency());
     setShowForm(false);
     setNotice("Credit record saved successfully.");
   };
@@ -200,6 +346,7 @@ export default function SupplierCredit() {
   const addPayment = (record: CreditRecord) => {
     const parsedAmount = Number(paymentAmount);
     const balance = getBalance(record);
+    const recordCurrency = getCurrency(record);
 
     if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
       setNotice("Enter a valid payment amount greater than zero.");
@@ -207,7 +354,12 @@ export default function SupplierCredit() {
     }
 
     if (parsedAmount > balance) {
-      setNotice(`Payment exceeds the outstanding balance of ${formatMoney(balance)}.`);
+      setNotice(
+        `Payment exceeds the outstanding balance of ${formatCurrency(
+          balance,
+          recordCurrency
+        )}.`
+      );
       return;
     }
 
@@ -240,7 +392,8 @@ export default function SupplierCredit() {
         <div>
           <h1>Suppliers & credit</h1>
           <p className="page-subtitle">
-            Track supplier balances, customer debts and every payment made or received.
+            Track supplier balances, customer debts and every payment made or
+            received.
           </p>
         </div>
         <div className="operations-heading-icon">
@@ -254,8 +407,17 @@ export default function SupplierCredit() {
             <ArrowUpRight size={19} />
           </div>
           <span>Supplier payables</span>
-          <strong>{formatMoney(totals.payable)}</strong>
-          <small>Outstanding amount owed</small>
+          <strong>
+            {formatCurrency(totals.payables.amount, shopCurrency)}
+          </strong>
+          <small>
+            Combined outstanding balance in {shopCurrency}
+          </small>
+          {totals.payables.missingCurrencies.length > 0 && (
+            <small>
+              Not converted: {totals.payables.missingCurrencies.join(", ")}
+            </small>
+          )}
         </article>
 
         <article className="surface-card credit-summary-card">
@@ -263,8 +425,17 @@ export default function SupplierCredit() {
             <ArrowDownLeft size={19} />
           </div>
           <span>Customer receivables</span>
-          <strong>{formatMoney(totals.receivable)}</strong>
-          <small>Outstanding amount to collect</small>
+          <strong>
+            {formatCurrency(totals.receivables.amount, shopCurrency)}
+          </strong>
+          <small>
+            Combined outstanding balance in {shopCurrency}
+          </small>
+          {totals.receivables.missingCurrencies.length > 0 && (
+            <small>
+              Not converted: {totals.receivables.missingCurrencies.join(", ")}
+            </small>
+          )}
         </article>
 
         <article className="surface-card credit-summary-card">
@@ -284,6 +455,21 @@ export default function SupplierCredit() {
           <strong>{totals.overdue}</strong>
           <small>Past due date with a balance</small>
         </article>
+      </div>
+
+      <div className="operations-note" role="status">
+        <Banknote size={16} />
+        <span>
+          {rateMessage} Exchange rates provided by{" "}
+          <a
+            href="https://www.exchangerate-api.com"
+            target="_blank"
+            rel="noreferrer"
+          >
+            ExchangeRate-API
+          </a>
+          . These are reference rates, not guaranteed settlement rates.
+        </span>
       </div>
 
       <section className="surface-card credit-workspace">
@@ -326,41 +512,94 @@ export default function SupplierCredit() {
 
             <div className="credit-form-grid">
               <label className="inventory-field">
-                <span>{type === "Payable" ? "Supplier name *" : "Customer name *"}</span>
-                <input value={party} onChange={(event) => setParty(event.target.value)} placeholder="Enter name" />
+                <span>
+                  {type === "Payable" ? "Supplier name *" : "Customer name *"}
+                </span>
+                <input
+                  value={party}
+                  onChange={(event) => setParty(event.target.value)}
+                  placeholder="Enter name"
+                />
               </label>
 
               <label className="inventory-field">
                 <span>Contact number</span>
-                <input value={contact} onChange={(event) => setContact(event.target.value)} placeholder="+256..." />
+                <input
+                  value={contact}
+                  onChange={(event) => setContact(event.target.value)}
+                  placeholder="+256..."
+                />
               </label>
 
               <label className="inventory-field">
                 <span>Invoice / sale reference</span>
-                <input value={reference} onChange={(event) => setReference(event.target.value)} placeholder="Invoice or transaction ID" />
+                <input
+                  value={reference}
+                  onChange={(event) => setReference(event.target.value)}
+                  placeholder="Invoice or transaction ID"
+                />
               </label>
 
               <label className="inventory-field">
-                <span>Original amount (UGX) *</span>
-                <input type="number" min="1" value={amount} onChange={(event) => setAmount(event.target.value)} placeholder="e.g. 500000" />
+                <span>Currency *</span>
+                <select
+                  value={currencyCode}
+                  onChange={(event) =>
+                    setCurrencyCode(event.target.value as CurrencyCode)
+                  }
+                >
+                  {CURRENCY_OPTIONS.map((currency) => (
+                    <option key={currency.code} value={currency.code}>
+                      {currency.code}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="inventory-field">
+                <span>Original amount ({currencyCode}) *</span>
+                <input
+                  type="number"
+                  min="0"
+                  step="any"
+                  value={amount}
+                  onChange={(event) => setAmount(event.target.value)}
+                  placeholder="Enter amount"
+                />
               </label>
 
               <label className="inventory-field">
                 <span>Due date</span>
-                <input type="date" value={dueDate} onChange={(event) => setDueDate(event.target.value)} />
+                <input
+                  type="date"
+                  value={dueDate}
+                  onChange={(event) => setDueDate(event.target.value)}
+                />
               </label>
 
               <label className="inventory-field credit-description-field">
                 <span>Description</span>
-                <input value={description} onChange={(event) => setDescription(event.target.value)} placeholder="e.g. Samsung stock invoice" />
+                <input
+                  value={description}
+                  onChange={(event) => setDescription(event.target.value)}
+                  placeholder="e.g. Samsung stock invoice"
+                />
               </label>
             </div>
 
             <div className="credit-form-actions">
-              <button className="button button-secondary" onClick={() => setShowForm(false)} type="button">
+              <button
+                className="button button-secondary"
+                onClick={() => setShowForm(false)}
+                type="button"
+              >
                 Cancel
               </button>
-              <button className="button button-primary" onClick={addRecord} type="button">
+              <button
+                className="button button-primary"
+                onClick={addRecord}
+                type="button"
+              >
                 <Plus size={16} /> Save credit record
               </button>
             </div>
@@ -374,7 +613,11 @@ export default function SupplierCredit() {
               className={activeTab === tab ? "is-active" : ""}
               onClick={() => setActiveTab(tab)}
             >
-              {tab === "All" ? "All accounts" : tab === "Payable" ? "Supplier payables" : "Customer receivables"}
+              {tab === "All"
+                ? "All accounts"
+                : tab === "Payable"
+                  ? "Supplier payables"
+                  : "Customer receivables"}
             </button>
           ))}
         </div>
@@ -383,7 +626,9 @@ export default function SupplierCredit() {
           <div className="inventory-empty">
             <Banknote size={26} />
             <strong>No credit records yet</strong>
-            <span>Create a supplier payable or customer receivable to begin.</span>
+            <span>
+              Create a supplier payable or customer receivable to begin.
+            </span>
           </div>
         ) : (
           <div className="credit-record-list">
@@ -392,43 +637,67 @@ export default function SupplierCredit() {
               const balance = getBalance(record);
               const status = getStatus(record);
               const paymentOpen = paymentRecordId === record.id;
+              const recordCurrency = getCurrency(record);
 
               return (
                 <article className="credit-record" key={record.id}>
                   <div className="credit-record-top">
                     <div className="credit-record-party">
-                      <div className={`credit-record-icon ${record.type.toLowerCase()}`}>
-                        {record.type === "Payable" ? <ArrowUpRight size={18} /> : <ArrowDownLeft size={18} />}
+                      <div
+                        className={`credit-record-icon ${record.type.toLowerCase()}`}
+                      >
+                        {record.type === "Payable" ? (
+                          <ArrowUpRight size={18} />
+                        ) : (
+                          <ArrowDownLeft size={18} />
+                        )}
                       </div>
                       <div>
                         <strong>{record.party}</strong>
-                        <span>{record.type === "Payable" ? "Supplier payable" : "Customer receivable"}</span>
+                        <span>
+                          {record.type === "Payable"
+                            ? "Supplier payable"
+                            : "Customer receivable"}
+                        </span>
                       </div>
                     </div>
-                    <span className={`credit-status ${status.toLowerCase().replace("-", "")}`}>
+                    <span
+                      className={`credit-status ${status
+                        .toLowerCase()
+                        .replace("-", "")}`}
+                    >
                       {status}
                     </span>
                   </div>
 
                   <div className="credit-record-details">
-                    {record.reference && <span>Reference: {record.reference}</span>}
+                    {record.reference && (
+                      <span>Reference: {record.reference}</span>
+                    )}
                     {record.description && <span>{record.description}</span>}
                     {record.contact && <span>{record.contact}</span>}
+                    <span>Currency: {recordCurrency}</span>
                     <span>Due: {formatDate(record.dueDate)}</span>
                   </div>
 
                   <div className="credit-amount-grid">
                     <div>
                       <span>Original amount</span>
-                      <strong>{formatMoney(record.originalAmount)}</strong>
+                      <strong>
+                        {formatCurrency(record.originalAmount, recordCurrency)}
+                      </strong>
                     </div>
                     <div>
                       <span>Paid</span>
-                      <strong>{formatMoney(paid)}</strong>
+                      <strong>
+                        {formatCurrency(paid, recordCurrency)}
+                      </strong>
                     </div>
                     <div>
                       <span>Remaining balance</span>
-                      <strong className="credit-balance">{formatMoney(balance)}</strong>
+                      <strong className="credit-balance">
+                        {formatCurrency(balance, recordCurrency)}
+                      </strong>
                     </div>
                   </div>
 
@@ -438,7 +707,9 @@ export default function SupplierCredit() {
                       {record.payments.map((payment) => (
                         <div key={payment.id}>
                           <span>{formatDate(payment.date)}</span>
-                          <strong>{formatMoney(payment.amount)}</strong>
+                          <strong>
+                            {formatCurrency(payment.amount, recordCurrency)}
+                          </strong>
                         </div>
                       ))}
                     </div>
@@ -449,17 +720,39 @@ export default function SupplierCredit() {
                       {paymentOpen ? (
                         <div className="credit-payment-form">
                           <label className="inventory-field">
-                            <span>Payment amount (UGX)</span>
-                            <input type="number" min="1" max={balance} value={paymentAmount} onChange={(event) => setPaymentAmount(event.target.value)} placeholder={`Up to ${balance}`} />
+                            <span>Payment amount ({recordCurrency})</span>
+                            <input
+                              type="number"
+                              min="0"
+                              max={balance}
+                              step="any"
+                              value={paymentAmount}
+                              onChange={(event) =>
+                                setPaymentAmount(event.target.value)
+                              }
+                              placeholder={`Up to ${balance}`}
+                            />
                           </label>
                           <label className="inventory-field">
                             <span>Payment date</span>
-                            <input type="date" value={paymentDate} onChange={(event) => setPaymentDate(event.target.value)} />
+                            <input
+                              type="date"
+                              value={paymentDate}
+                              onChange={(event) =>
+                                setPaymentDate(event.target.value)
+                              }
+                            />
                           </label>
-                          <button className="button button-primary" onClick={() => addPayment(record)}>
+                          <button
+                            className="button button-primary"
+                            onClick={() => addPayment(record)}
+                          >
                             <CheckCircle2 size={15} /> Record payment
                           </button>
-                          <button className="button button-secondary" onClick={() => setPaymentRecordId("")}>
+                          <button
+                            className="button button-secondary"
+                            onClick={() => setPaymentRecordId("")}
+                          >
                             Cancel
                           </button>
                         </div>
@@ -493,7 +786,12 @@ export default function SupplierCredit() {
       <div className="operations-note">
         <Banknote size={16} />
         <span>
-          Credit records and payments are stored locally in this browser. They do not automatically create sales, change inventory, or update cash received in Reports and Daily Closing. Cloud sync, staff permissions and secure backups are not implemented yet.
+          Credit records and payments are stored locally in this browser.
+          Individual ledger balances remain in their original currencies.
+          Summary totals use the latest successfully saved exchange-rate
+          snapshot. They do not automatically create sales, change inventory,
+          or update cash received in Reports and Daily Closing. Cloud sync,
+          staff permissions and secure backups are not implemented yet.
         </span>
       </div>
     </section>
