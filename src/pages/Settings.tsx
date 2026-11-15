@@ -1,9 +1,10 @@
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   Building2,
   CheckCircle2,
   Save,
+  Search,
   Settings2,
   ShieldCheck,
 } from "lucide-react";
@@ -23,7 +24,24 @@ export default function Settings() {
     () => getShopSettings().currencyCode
   );
 
+  const [currencySearch, setCurrencySearch] = useState("");
   const [notice, setNotice] = useState("");
+
+  const filteredCurrencies = useMemo(() => {
+    const search = currencySearch.trim().toLowerCase();
+
+    if (!search) {
+      return CURRENCY_OPTIONS;
+    }
+
+    return CURRENCY_OPTIONS.filter((currency) =>
+      currency.code.toLowerCase().includes(search)
+    );
+  }, [currencySearch]);
+
+  const selectedCurrency = CURRENCY_OPTIONS.find(
+    (currency) => currency.code === currencyCode
+  );
 
   const handleSave = () => {
     const cleanedName = shopName.trim();
@@ -45,7 +63,8 @@ export default function Settings() {
   return (
     <section className="operations-page page-content">
       <div className="eyebrow">
-        <span className="eyebrow-line" /> PREFERENCES & CONTROLS
+        <span className="eyebrow-line" />
+        PREFERENCES &amp; CONTROLS
       </div>
 
       <div className="operations-heading">
@@ -69,8 +88,10 @@ export default function Settings() {
           <div className="operations-form">
             <label className="inventory-field">
               <span>Shop name</span>
+
               <div className="identifier-input-wrap">
                 <Building2 size={17} />
+
                 <input
                   type="text"
                   value={shopName}
@@ -85,27 +106,68 @@ export default function Settings() {
             </label>
 
             <label className="inventory-field">
+              <span>Search currencies</span>
+
+              <div className="identifier-input-wrap">
+                <Search size={17} />
+
+                <input
+                  type="text"
+                  value={currencySearch}
+                  onChange={(event) => {
+                    setCurrencySearch(event.target.value);
+                    setNotice("");
+                  }}
+                  placeholder="Search by code, e.g. AED or CNY"
+                />
+              </div>
+            </label>
+
+            <label className="inventory-field">
               <span>Default operating currency</span>
+
               <select
                 value={currencyCode}
                 onChange={(event) => {
-                  setCurrencyCode(
-                    event.target.value as CurrencyCode
-                  );
+                  setCurrencyCode(event.target.value);
                   setNotice("");
                 }}
               >
-                {CURRENCY_OPTIONS.map((currency) => (
-                  <option key={currency.code} value={currency.code}>
-                    {currency.label}
+                {filteredCurrencies.length === 0 ? (
+                  <option value={currencyCode}>
+                    No matching currencies
                   </option>
-                ))}
+                ) : (
+                  filteredCurrencies.map((currency) => (
+                    <option
+                      key={currency.code}
+                      value={currency.code}
+                    >
+                      {currency.code} — {currency.decimalPlaces} decimal places
+                    </option>
+                  ))
+                )}
               </select>
+
               <small className="field-hint">
-                This currency will be used for new financial records.
-                Existing records keep their original currency.
+                Search using a three-letter currency code. Your selected
+                currency becomes the default for new shop transactions.
               </small>
+
+              {filteredCurrencies.length === 0 && (
+                <small className="field-hint">
+                  No matching currency found. Try another code.
+                </small>
+              )}
             </label>
+          </div>
+
+          <div className="operations-note">
+            <ShieldCheck size={16} />
+            <span>
+              Current selection: {selectedCurrency?.code || currencyCode}.
+              Existing transactions retain their original currency.
+            </span>
           </div>
 
           {notice && (
@@ -144,40 +206,46 @@ export default function Settings() {
           <div className="inventory-card-heading">
             <div>
               <div className="card-kicker">CURRENCY STANDARD</div>
-              <h2>Supported currencies</h2>
+              <h2>Currency information</h2>
             </div>
             <Building2 size={19} />
           </div>
 
           <div className="operations-record-list">
-            {CURRENCY_OPTIONS.map((currency) => (
-              <article
-                className="operations-record"
-                key={currency.code}
-              >
-                <div className="operations-record-icon">
-                  <Building2 size={17} />
-                </div>
+            <article className="operations-record">
+              <div className="operations-record-icon">
+                <Building2 size={17} />
+              </div>
 
-                <div className="operations-record-copy">
-                  <strong>{currency.code}</strong>
-                  <span>{currency.label}</span>
-                </div>
+              <div className="operations-record-copy">
+                <strong>{currencyCode}</strong>
+                <span>Selected operating currency</span>
+              </div>
 
-                <span className="inventory-device-status status-available">
-                  {currency.decimalPlaces} decimals
-                </span>
-              </article>
-            ))}
+              <span className="inventory-device-status status-available">
+                {selectedCurrency?.decimalPlaces ?? 2} decimals
+              </span>
+            </article>
+
+            <article className="operations-record">
+              <div className="operations-record-icon">
+                <ShieldCheck size={17} />
+              </div>
+
+              <div className="operations-record-copy">
+                <strong>{CURRENCY_OPTIONS.length} currencies</strong>
+                <span>Available in this browser</span>
+              </div>
+            </article>
           </div>
 
           <div className="operations-note">
             <ShieldCheck size={16} />
             <span>
-              UGX uses whole amounts, USD uses two decimal places,
-              and KWD uses three. Financial reports must keep
-              different currencies separate unless an explicit
-              exchange-rate conversion is implemented.
+              Currency precision is determined automatically. For example,
+              UGX and JPY use zero decimal places, USD uses two, and KWD
+              uses three. Live exchange-rate conversion will be added
+              separately.
             </span>
           </div>
         </section>
