@@ -1,4 +1,4 @@
-
+import DailyClosing from "./DailyClosing";
 import { useEffect, useMemo, useState } from "react";
 import {
   ArrowLeftRight,
@@ -844,9 +844,13 @@ export default function Operations({ page }: { page: PageKey }) {
   );
   const [notice, setNotice] = useState("");
 
-  if (page === "Reports") {
-    return <ReportsView />;
-  }
+ if (page === "Daily closing") {
+  return <DailyClosing />;
+}
+
+if (page === "Reports") {
+  return <ReportsView />;
+}
 
   if (!details) return null;
 
