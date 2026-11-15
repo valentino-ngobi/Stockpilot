@@ -5,6 +5,7 @@ import {
   BriefcaseBusiness,
   ClipboardCheck,
   LayoutDashboard,
+  ShoppingCart,
   Settings2,
   Smartphone,
   Users,
@@ -17,6 +18,7 @@ export type PageKey =
   | "Overview"
   | "Inventory"
   | "Sales"
+  | "Purchases"
   | "Custody"
   | "Repairs"
   | "Daily closing"
@@ -36,6 +38,7 @@ const primaryItems = [
   { label: "Overview", icon: LayoutDashboard },
   { label: "Inventory", icon: Smartphone },
   { label: "Sales", icon: Activity },
+  { label: "Purchases", icon: ShoppingCart },
   { label: "Custody", icon: Boxes },
   { label: "Repairs", icon: Wrench },
   { label: "Daily closing", icon: ClipboardCheck },

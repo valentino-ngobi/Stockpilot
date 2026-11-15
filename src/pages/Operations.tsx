@@ -1,4 +1,6 @@
 import DailyClosing from "./DailyClosing";
+import Settings from "./Settings";
+import Purchases from "./Purchases";
 import SupplierCredit from "./SupplierCredit";
 import { useEffect, useMemo, useState } from "react";
 import {
@@ -853,8 +855,15 @@ if (page === "Suppliers & credit") {
   return <SupplierCredit />;
 }
 
+if (page === "Purchases") {
+  return <Purchases />;
+}
+
 if (page === "Reports") {
   return <ReportsView />;
+}
+if (page === "Settings") {
+  return <Settings />;
 }
 
   if (!details) return null;
