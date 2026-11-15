@@ -12,7 +12,26 @@ export type CurrencyOption = {
   decimalPlaces: number;
 };
 
+export type ExchangeRateSnapshot = {
+  baseCode: CurrencyCode;
+  rates: Record<string, number>;
+  fetchedAt: string;
+  lastUpdatedAt: string;
+  nextUpdateAt: string;
+  provider: string;
+};
+
+type ExchangeRateApiResponse = {
+  result?: string;
+  base_code?: string;
+  rates?: Record<string, number>;
+  time_last_update_utc?: string;
+  time_next_update_utc?: string;
+};
+
 export const SETTINGS_STORAGE_KEY = "stockpilot-settings";
+export const EXCHANGE_RATES_STORAGE_KEY =
+  "stockpilot-exchange-rate-snapshots";
 
 export const DEFAULT_SETTINGS: ShopSettings = {
   shopName: "Val Gadgets Demo",
@@ -30,14 +49,12 @@ function getSupportedCurrencyCodes(): string[] {
     const codes = intlWithCurrencyList.supportedValuesOf?.("currency");
 
     if (codes && codes.length > 0) {
-      return [...new Set([...codes, "UGX", "KWD", "AED", "CNY"])]
-        .sort();
+      return [...new Set([...codes, "UGX", "KWD", "AED", "CNY"])].sort();
     }
   } catch (error) {
     console.error("Could not load currency list:", error);
   }
 
-  // Fallback for browsers without supportedValuesOf.
   return [
     "AED", "AUD", "BDT", "BHD", "BIF", "BRL", "CAD",
     "CHF", "CNY", "DKK", "EGP", "EUR", "GBP", "GHS",
@@ -182,4 +199,165 @@ export function formatMoneyInput(
   return parts.length > 1
     ? `${groupedInteger}.${decimalPart}`
     : groupedInteger;
+}
+
+// Read previously saved exchange-rate snapshots without changing them.
+export function getSavedExchangeRateSnapshot(
+  baseCode: CurrencyCode,
+): ExchangeRateSnapshot | null {
+  try {
+    const saved = localStorage.getItem(EXCHANGE_RATES_STORAGE_KEY);
+
+    if (!saved) return null;
+
+    const parsed = JSON.parse(saved) as Record<
+      string,
+      ExchangeRateSnapshot
+    >;
+
+    const snapshot = parsed[baseCode];
+
+    if (
+      !snapshot ||
+      snapshot.baseCode !== baseCode ||
+      typeof snapshot.rates !== "object" ||
+      !snapshot.rates
+    ) {
+      return null;
+    }
+
+    return snapshot;
+  } catch (error) {
+    console.error("Could not read exchange-rate snapshot:", error);
+    return null;
+  }
+}
+
+// Check whether the saved snapshot has reached its provider update time.
+export function isExchangeRateSnapshotExpired(
+  snapshot: ExchangeRateSnapshot,
+): boolean {
+  const nextUpdate = new Date(snapshot.nextUpdateAt).getTime();
+
+  if (!Number.isFinite(nextUpdate)) return true;
+
+  return Date.now() >= nextUpdate;
+}
+
+// Fetch a fresh daily reference-rate table and save its snapshot.
+// This function does not modify any purchase, credit, or payment records.
+export async function refreshExchangeRateSnapshot(
+  baseCode: CurrencyCode,
+): Promise<ExchangeRateSnapshot> {
+  if (!isCurrencyCode(baseCode)) {
+    throw new Error("The selected operating currency is invalid.");
+  }
+
+  const response = await fetch(
+    `https://open.er-api.com/v6/latest/${baseCode}`,
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `Exchange-rate service returned HTTP ${response.status}.`,
+    );
+  }
+
+  const data = (await response.json()) as ExchangeRateApiResponse;
+
+  if (
+    data.result !== "success" ||
+    data.base_code !== baseCode ||
+    !data.rates ||
+    typeof data.rates !== "object"
+  ) {
+    throw new Error(
+      "The exchange-rate service returned an invalid response.",
+    );
+  }
+
+  const rates: Record<string, number> = {};
+
+  Object.entries(data.rates).forEach(([code, rate]) => {
+    if (
+      isCurrencyCode(code) &&
+      typeof rate === "number" &&
+      Number.isFinite(rate) &&
+      rate > 0
+    ) {
+      rates[code] = rate;
+    }
+  });
+
+  rates[baseCode] = 1;
+
+  const now = new Date();
+  const lastUpdatedAt =
+    data.time_last_update_utc &&
+    Number.isFinite(Date.parse(data.time_last_update_utc))
+      ? new Date(data.time_last_update_utc).toISOString()
+      : now.toISOString();
+
+  const nextUpdateAt =
+    data.time_next_update_utc &&
+    Number.isFinite(Date.parse(data.time_next_update_utc))
+      ? new Date(data.time_next_update_utc).toISOString()
+      : new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
+
+  const snapshot: ExchangeRateSnapshot = {
+    baseCode,
+    rates,
+    fetchedAt: now.toISOString(),
+    lastUpdatedAt,
+    nextUpdateAt,
+    provider: "ExchangeRate-API Open Access",
+  };
+
+  try {
+    const saved = localStorage.getItem(EXCHANGE_RATES_STORAGE_KEY);
+    const allSnapshots = saved
+      ? (JSON.parse(saved) as Record<string, ExchangeRateSnapshot>)
+      : {};
+
+    allSnapshots[baseCode] = snapshot;
+
+    localStorage.setItem(
+      EXCHANGE_RATES_STORAGE_KEY,
+      JSON.stringify(allSnapshots),
+    );
+  } catch (error) {
+    console.error("Could not save exchange-rate snapshot:", error);
+    throw new Error("Could not save exchange rates in browser storage.");
+  }
+
+  return snapshot;
+}
+
+// Convert an amount into the snapshot's base currency.
+// The rate table is based on 1 unit of the base currency.
+// Example: if 1 UGX = 0.00028 AED, AED is divided by that rate
+// to calculate its UGX equivalent.
+export function convertToSnapshotCurrency(
+  amount: number,
+  fromCode: CurrencyCode,
+  snapshot: ExchangeRateSnapshot,
+): number | null {
+  if (!Number.isFinite(amount)) return null;
+
+  const sourceCode = getRecordCurrency(fromCode);
+  const baseCode = snapshot.baseCode;
+
+  if (sourceCode === baseCode) return amount;
+
+  const sourceRate = snapshot.rates[sourceCode];
+
+  if (
+    typeof sourceRate !== "number" ||
+    !Number.isFinite(sourceRate) ||
+    sourceRate <= 0
+  ) {
+    return null;
+  }
+
+  return amount / sourceRate;
 }
