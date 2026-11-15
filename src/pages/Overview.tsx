@@ -1,3 +1,5 @@
+
+import { useMemo, useState, useEffect } from "react";
 import {
   ArrowRight,
   ArrowUpRight,
@@ -11,32 +13,280 @@ import {
   Wallet,
   Boxes as BoxesIcon,
   Wrench as WrenchIcon,
+  Package,
+  ShoppingCart,
 } from "lucide-react";
-import { demoDevices, formatUGX } from "../data/mockData";
 import type { PageKey } from "../components/Sidebar";
 import MetricCard from "../components/MetricCard";
-import ActivityList from "../components/ActivityList";
 
 interface OverviewProps {
   onNavigate: (page: PageKey) => void;
 }
 
+type InventoryRecord = {
+  id: string;
+  brand: string;
+  model: string;
+  identifier: string;
+  status: "In shop" | "With middle-man" | "At repairer" | "Sold";
+  colour?: string;
+  storage?: string;
+  costPrice?: string;
+  sellingPrice?: string;
+  category?: "Device" | "Accessory / spare part";
+  quantity?: number;
+  updated: string;
+};
+
+type SaleRecord = {
+  id: string;
+  deviceId: string;
+  deviceName: string;
+  identifier: string;
+  salePrice: number;
+  paymentMethod: string;
+  transactionDate: string;
+  costPrice: number;
+};
+
+const INVENTORY_KEY = "stockpilot-inventory";
+const SALES_KEY = "stockpilot-sales";
+
+function readInventory(): InventoryRecord[] {
+  try {
+    const saved = localStorage.getItem(INVENTORY_KEY);
+    return saved ? JSON.parse(saved) as InventoryRecord[] : [];
+  } catch (error) {
+    console.error("Could not read inventory:", error);
+    return [];
+  }
+}
+
+function readSales(): SaleRecord[] {
+  try {
+    const saved = localStorage.getItem(SALES_KEY);
+    return saved ? JSON.parse(saved) as SaleRecord[] : [];
+  } catch (error) {
+    console.error("Could not read sales:", error);
+    return [];
+  }
+}
+
+function formatUGX(amount: number): string {
+  return new Intl.NumberFormat("en-UG", {
+    style: "currency",
+    currency: "UGX",
+    maximumFractionDigits: 0,
+  }).format(amount);
+}
+
+function localDateKey(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function formatCompact(amount: number): string {
+  if (amount >= 1_000_000) {
+    return `${(amount / 1_000_000).toFixed(1)}M`;
+  }
+
+  if (amount >= 1_000) {
+    return `${(amount / 1_000).toFixed(0)}K`;
+  }
+
+  return String(Math.round(amount));
+}
+
+function getStatusClass(status: InventoryRecord["status"]): string {
+  if (status === "In shop") return "available";
+  if (status === "With middle-man") return "custody";
+  if (status === "At repairer") return "repair";
+  return "sold";
+}
+
 export default function Overview({ onNavigate }: OverviewProps) {
-  const availableCount = demoDevices.filter((device) => device.status === "In shop").length;
+  const [inventory, setInventory] = useState<InventoryRecord[]>(readInventory);
+  const [sales, setSales] = useState<SaleRecord[]>(readSales);
+  const [now, setNow] = useState(new Date());
+
+  useEffect(() => {
+    const refreshData = () => {
+      setInventory(readInventory());
+      setSales(readSales());
+      setNow(new Date());
+    };
+
+    window.addEventListener("focus", refreshData);
+    window.addEventListener("storage", refreshData);
+
+    return () => {
+      window.removeEventListener("focus", refreshData);
+      window.removeEventListener("storage", refreshData);
+    };
+  }, []);
+
+  const todayKey = localDateKey(now);
+
+  const stock = useMemo(() => {
+    const active = inventory.filter((item) => item.status !== "Sold");
+
+    const units = (item: InventoryRecord) =>
+      item.category === "Accessory / spare part"
+        ? Math.max(0, Number(item.quantity) || 0)
+        : 1;
+
+    const stockValue = active.reduce(
+      (total, item) =>
+        total + (Number(item.costPrice) || 0) * units(item),
+      0
+    );
+
+    return {
+      totalUnits: active.reduce((total, item) => total + units(item), 0),
+      totalDevices: active.filter(
+        (item) => item.category !== "Accessory / spare part"
+      ).length,
+      accessoryUnits: active
+        .filter((item) => item.category === "Accessory / spare part")
+        .reduce((total, item) => total + units(item), 0),
+      inShop: active
+        .filter((item) => item.status === "In shop")
+        .reduce((total, item) => total + units(item), 0),
+      withMiddleman: active
+        .filter((item) => item.status === "With middle-man")
+        .reduce((total, item) => total + units(item), 0),
+      atRepairer: active
+        .filter((item) => item.status === "At repairer")
+        .reduce((total, item) => total + units(item), 0),
+      stockValue,
+    };
+  }, [inventory]);
+
+  const todaySales = useMemo(
+    () =>
+      sales.filter((sale) => {
+        const date = new Date(sale.transactionDate);
+        return !Number.isNaN(date.getTime()) &&
+          localDateKey(date) === todayKey;
+      }),
+    [sales, todayKey]
+  );
+
+  const todayRevenue = todaySales.reduce(
+    (total, sale) => total + (Number(sale.salePrice) || 0),
+    0
+  );
+
+  const cashReceived = todaySales
+    .filter((sale) => sale.paymentMethod === "Cash")
+    .reduce((total, sale) => total + (Number(sale.salePrice) || 0), 0);
+
+  const followUpCount = stock.withMiddleman + stock.atRepairer;
+
+  const lastSevenDays = useMemo(() => {
+    return Array.from({ length: 7 }, (_, index) => {
+      const date = new Date(now);
+      date.setDate(now.getDate() - (6 - index));
+
+      const key = localDateKey(date);
+      const total = sales
+        .filter((sale) => {
+          const saleDate = new Date(sale.transactionDate);
+          return !Number.isNaN(saleDate.getTime()) &&
+            localDateKey(saleDate) === key;
+        })
+        .reduce(
+          (sum, sale) => sum + (Number(sale.salePrice) || 0),
+          0
+        );
+
+      return {
+        label: date.toLocaleDateString("en-UG", { weekday: "short" }),
+        total,
+      };
+    });
+  }, [sales, now]);
+
+  const weeklyRevenue = lastSevenDays.reduce(
+    (total, day) => total + day.total,
+    0
+  );
+
+  const previousSevenDaysRevenue = useMemo(() => {
+    const start = new Date(now);
+    start.setDate(now.getDate() - 13);
+    start.setHours(0, 0, 0, 0);
+
+    const end = new Date(now);
+    end.setDate(now.getDate() - 7);
+    end.setHours(0, 0, 0, 0);
+
+    return sales
+      .filter((sale) => {
+        const date = new Date(sale.transactionDate);
+        return !Number.isNaN(date.getTime()) &&
+          date >= start && date < new Date(end.getTime() + 86400000);
+      })
+      .reduce((total, sale) => total + (Number(sale.salePrice) || 0), 0);
+  }, [sales, now]);
+
+  const weeklyChange =
+    previousSevenDaysRevenue > 0
+      ? ((weeklyRevenue - previousSevenDaysRevenue) /
+          previousSevenDaysRevenue) * 100
+      : null;
+
+  const maxChartValue = Math.max(
+    ...lastSevenDays.map((day) => day.total),
+    1
+  );
+
+  const recentSales = sales.slice(0, 5);
+
+  const recentInventory = [...inventory]
+    .filter((item) => item.status !== "Sold")
+    .slice(-5)
+    .reverse();
+
+  const greeting =
+    now.getHours() < 12
+      ? "Good morning"
+      : now.getHours() < 17
+        ? "Good afternoon"
+        : "Good evening";
 
   return (
     <div className="page-content">
       <section className="welcome-row">
         <div>
-          <div className="eyebrow"><span className="eyebrow-line" /> SUNDAY, OCTOBER 25</div>
-          <h1>Good morning, <span>Val.</span></h1>
-          <p className="page-subtitle">Here's what's happening across your shop today.</p>
+          <div className="eyebrow">
+            <span className="eyebrow-line" />
+            {now.toLocaleDateString("en-UG", {
+              weekday: "long",
+              day: "numeric",
+              month: "long",
+              year: "numeric",
+            }).toUpperCase()}
+          </div>
+          <h1>{greeting}, <span>Val.</span></h1>
+          <p className="page-subtitle">
+            Here's what's happening across your shop today.
+          </p>
         </div>
+
         <div className="welcome-actions">
-          <button className="button button-secondary" onClick={() => onNavigate("Reports")}>
-            <Download size={16} /> Export report
+          <button
+            className="button button-secondary"
+            onClick={() => onNavigate("Reports")}
+          >
+            <Download size={16} /> Reports
           </button>
-          <button className="button button-primary" onClick={() => onNavigate("Inventory")}>
+          <button
+            className="button button-primary"
+            onClick={() => onNavigate("Inventory")}
+          >
             <Plus size={17} /> Add stock
           </button>
         </div>
@@ -45,18 +295,44 @@ export default function Overview({ onNavigate }: OverviewProps) {
       <section className="status-strip" aria-label="System status">
         <div className="status-left">
           <span className="status-pulse" />
-          <span className="status-title">All systems operational</span>
+          <span className="status-title">Local data connected</span>
           <span className="status-divider" />
-          <span className="status-detail">Demo data only</span>
+          <span className="status-detail">Browser storage</span>
         </div>
-        <div className="status-right"><Clock3 size={14} /> Last updated just now</div>
+        <div className="status-right">
+          <Clock3 size={14} /> Updated just now
+        </div>
       </section>
 
       <section className="metrics-grid" aria-label="Shop metrics">
-        <MetricCard label="Inventory at cost" value="UGX 18.42M" note="Owned stock value" icon={BoxesIcon} tone="blue" trend="↗ 8.2%" />
-        <MetricCard label="Sales today" value="UGX 2.84M" note="12 recorded transactions" icon={ReceiptText} tone="violet" trend="↗ 12.6%" />
-        <MetricCard label="Expected cash" value="UGX 1.96M" note="Awaiting closing count" icon={Wallet} tone="cyan" />
-        <MetricCard label="Needs follow-up" value="06 items" note="Custody and repairs" icon={CircleAlert} tone="amber" />
+        <MetricCard
+          label="Inventory at cost"
+          value={formatUGX(stock.stockValue)}
+          note="Unsold stock at recorded cost"
+          icon={BoxesIcon}
+          tone="blue"
+        />
+        <MetricCard
+          label="Sales today"
+          value={formatUGX(todayRevenue)}
+          note={`${todaySales.length} recorded transactions`}
+          icon={ReceiptText}
+          tone="violet"
+        />
+        <MetricCard
+          label="Cash received today"
+          value={formatUGX(cashReceived)}
+          note="Cash payments only"
+          icon={Wallet}
+          tone="cyan"
+        />
+        <MetricCard
+          label="Needs follow-up"
+          value={`${followUpCount} items`}
+          note={`${stock.withMiddleman} with middle-men · ${stock.atRepairer} at repairers`}
+          icon={CircleAlert}
+          tone="amber"
+        />
       </section>
 
       <section className="main-grid">
@@ -66,37 +342,92 @@ export default function Overview({ onNavigate }: OverviewProps) {
               <div className="card-kicker">PERFORMANCE</div>
               <h2>Sales overview</h2>
             </div>
-            <button className="select-button"><CalendarDays size={15} /> Last 7 days <span>⌄</span></button>
+            <div className="select-button">
+              <CalendarDays size={15} /> Last 7 days
+            </div>
           </div>
+
           <div className="sales-summary">
             <div>
-              <div className="sales-total">UGX 14.28M</div>
-              <div className="sales-comparison"><span className="positive"><ArrowUpRight size={14} /> 9.4%</span> <span>vs previous 7 days</span></div>
+              <div className="sales-total">{formatUGX(weeklyRevenue)}</div>
+              <div className="sales-comparison">
+                {weeklyChange === null ? (
+                  <span>No previous-week comparison yet</span>
+                ) : (
+                  <>
+                    <span className={weeklyChange >= 0 ? "positive" : ""}>
+                      <ArrowUpRight size={14} />
+                      {Math.abs(weeklyChange).toFixed(1)}%
+                    </span>
+                    <span>vs previous 7 days</span>
+                  </>
+                )}
+              </div>
             </div>
-            <div className="sales-legend"><span className="legend-dot legend-current" /> This week <span className="legend-dot legend-previous" /> Previous</div>
+            <div className="sales-legend">
+              <span className="legend-dot legend-current" /> This week
+            </div>
           </div>
-          <div className="chart-area" role="img" aria-label="Illustrative seven-day sales chart">
-            <div className="chart-y-labels"><span>4M</span><span>3M</span><span>2M</span><span>1M</span><span>0</span></div>
+
+          <div className="chart-area" role="img" aria-label="Actual sales for the last seven days">
+            <div className="chart-y-labels">
+              <span>{formatCompact(maxChartValue)}</span>
+              <span>{formatCompact(maxChartValue * 0.75)}</span>
+              <span>{formatCompact(maxChartValue * 0.5)}</span>
+              <span>{formatCompact(maxChartValue * 0.25)}</span>
+              <span>0</span>
+            </div>
+
             <div className="chart-plot">
-              <div className="chart-grid-lines"><i /><i /><i /><i /><i /></div>
-              <svg className="chart-svg" viewBox="0 0 600 190" preserveAspectRatio="none" aria-hidden="true">
-                <defs>
-                  <linearGradient id="salesFill" x1="0" x2="0" y1="0" y2="1">
-                    <stop offset="0%" stopColor="#6D7CFF" stopOpacity=".28" />
-                    <stop offset="100%" stopColor="#6D7CFF" stopOpacity="0" />
-                  </linearGradient>
-                </defs>
-                <path d="M0,140 C35,125 45,135 82,108 S135,122 170,88 S220,100 255,75 S300,96 340,57 S395,74 425,44 S485,78 515,34 S570,53 600,20 L600,190 L0,190 Z" fill="url(#salesFill)" />
-                <path d="M0,140 C35,125 45,135 82,108 S135,122 170,88 S220,100 255,75 S300,96 340,57 S395,74 425,44 S485,78 515,34 S570,53 600,20" fill="none" stroke="#7B87FF" strokeWidth="3" vectorEffect="non-scaling-stroke" strokeLinecap="round" />
-                <path d="M0,162 C45,154 65,166 105,146 S160,157 205,135 S265,150 300,126 S360,139 405,119 S470,134 510,107 S560,124 600,96" fill="none" stroke="#3D4862" strokeWidth="2" strokeDasharray="5 6" vectorEffect="non-scaling-stroke" />
-                <circle cx="515" cy="34" r="5" fill="#0D111B" stroke="#A5ACFF" strokeWidth="3" vectorEffect="non-scaling-stroke" />
-              </svg>
-              <div className="chart-x-labels"><span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span></div>
+              <div className="chart-grid-lines">
+                <i /><i /><i /><i /><i />
+              </div>
+
+              <div
+                style={{
+                  position: "absolute",
+                  inset: "8px 0 25px",
+                  display: "flex",
+                  alignItems: "flex-end",
+                  justifyContent: "space-around",
+                  gap: "10px",
+                  padding: "0 8px",
+                }}
+              >
+                {lastSevenDays.map((day) => (
+                  <div
+                    key={day.label}
+                    title={`${day.label}: ${formatUGX(day.total)}`}
+                    style={{
+                      flex: 1,
+                      maxWidth: "48px",
+                      height: `${Math.max((day.total / maxChartValue) * 100, 2)}%`,
+                      minHeight: "2px",
+                      borderRadius: "5px 5px 0 0",
+                      background: "linear-gradient(180deg, #8b91ff, #5968d9)",
+                    }}
+                  />
+                ))}
+              </div>
+
+              <div className="chart-x-labels">
+                {lastSevenDays.map((day, index) => (
+                  <span key={`${day.label}-${index}`}>{day.label}</span>
+                ))}
+              </div>
             </div>
           </div>
+
           <div className="chart-footer">
-            <span><span className="footer-dot" /> Sales are sample figures for layout testing</span>
-            <button className="text-button" onClick={() => onNavigate("Reports")}>View reports <ArrowRight size={15} /></button>
+            <span>
+              <span className="footer-dot" /> Based on recorded transactions
+            </span>
+            <button
+              className="text-button"
+              onClick={() => onNavigate("Reports")}
+            >
+              View reports <ArrowRight size={15} />
+            </button>
           </div>
         </article>
 
@@ -106,21 +437,58 @@ export default function Overview({ onNavigate }: OverviewProps) {
               <div className="card-kicker">INVENTORY HEALTH</div>
               <h2>Stock at a glance</h2>
             </div>
-            <button className="icon-button" aria-label="Open inventory" onClick={() => onNavigate("Inventory")}><ArrowUpRight size={17} /></button>
+            <button
+              className="icon-button"
+              aria-label="Open inventory"
+              onClick={() => onNavigate("Inventory")}
+            >
+              <ArrowUpRight size={17} />
+            </button>
           </div>
+
           <div className="stock-hero">
-            <div className="stock-ring"><div><strong>248</strong><span>total items</span></div></div>
+            <div className="stock-ring">
+              <div>
+                <strong>{stock.totalUnits}</strong>
+                <span>stock units</span>
+              </div>
+            </div>
+
             <div className="stock-legend">
-              <div><span className="stock-key key-blue" /><span>In shop</span><strong>218</strong></div>
-              <div><span className="stock-key key-violet" /><span>With middle-men</span><strong>18</strong></div>
-              <div><span className="stock-key key-amber" /><span>At repairers</span><strong>12</strong></div>
+              <div>
+                <span className="stock-key key-blue" />
+                <span>In shop</span>
+                <strong>{stock.inShop}</strong>
+              </div>
+              <div>
+                <span className="stock-key key-violet" />
+                <span>With middle-men</span>
+                <strong>{stock.withMiddleman}</strong>
+              </div>
+              <div>
+                <span className="stock-key key-amber" />
+                <span>At repairers</span>
+                <strong>{stock.atRepairer}</strong>
+              </div>
             </div>
           </div>
+
           <div className="stock-note">
-            <div className="stock-note-icon"><Smartphone size={16} /></div>
-            <div><strong>{availableCount} demo phones shown in the table</strong><span>Detailed counts are illustrative.</span></div>
+            <div className="stock-note-icon">
+              <Smartphone size={16} />
+            </div>
+            <div>
+              <strong>{stock.totalDevices} devices · {stock.accessoryUnits} accessory units</strong>
+              <span>Sold stock is excluded from current stock totals.</span>
+            </div>
           </div>
-          <button className="button button-secondary button-full" onClick={() => onNavigate("Inventory")}>Open inventory <ArrowRight size={16} /></button>
+
+          <button
+            className="button button-secondary button-full"
+            onClick={() => onNavigate("Inventory")}
+          >
+            Open inventory <ArrowRight size={16} />
+          </button>
         </article>
       </section>
 
@@ -128,12 +496,44 @@ export default function Overview({ onNavigate }: OverviewProps) {
         <article className="surface-card activity-card">
           <div className="card-heading">
             <div>
-              <div className="card-kicker">LIVE FEED</div>
-              <h2>Recent activity</h2>
+              <div className="card-kicker">TRANSACTION FEED</div>
+              <h2>Recent sales</h2>
             </div>
-            <button className="text-button" onClick={() => onNavigate("Custody")}>View all <ArrowRight size={15} /></button>
+            <button
+              className="text-button"
+              onClick={() => onNavigate("Sales")}
+            >
+              View all <ArrowRight size={15} />
+            </button>
           </div>
-          <ActivityList />
+
+          {recentSales.length === 0 ? (
+            <div className="inventory-empty">
+              <ReceiptText size={24} />
+              <strong>No sales recorded yet</strong>
+              <span>Completed sales will appear here.</span>
+            </div>
+          ) : (
+            <div className="operations-record-list">
+              {recentSales.map((sale) => (
+                <article className="operations-record" key={sale.id}>
+                  <div className="operations-record-icon">
+                    <ShoppingCart size={17} />
+                  </div>
+                  <div className="operations-record-copy">
+                    <strong>{sale.deviceName}</strong>
+                    <span>{sale.identifier}</span>
+                    <span>
+                      {new Date(sale.transactionDate).toLocaleString()}
+                    </span>
+                  </div>
+                  <strong className="operations-amount">
+                    {formatUGX(Number(sale.salePrice) || 0)}
+                  </strong>
+                </article>
+              ))}
+            </div>
+          )}
         </article>
 
         <article className="surface-card attention-card">
@@ -142,56 +542,158 @@ export default function Overview({ onNavigate }: OverviewProps) {
               <div className="card-kicker">ACTION REQUIRED</div>
               <h2>Needs your attention</h2>
             </div>
-            <span className="attention-count">3</span>
+            <span className="attention-count">{followUpCount}</span>
           </div>
-          <button className="attention-item" onClick={() => onNavigate("Custody")}>
-            <span className="attention-symbol symbol-violet"><ArrowUpRight size={17} /></span>
-            <span className="attention-copy"><strong>Middle-man follow-up</strong><small>2 phones awaiting an update</small></span>
-            <ArrowRight size={16} className="attention-arrow" />
-          </button>
-          <button className="attention-item" onClick={() => onNavigate("Repairs")}>
-            <span className="attention-symbol symbol-amber"><WrenchIcon /></span>
-            <span className="attention-copy"><strong>Repair status overdue</strong><small>1 phone has been away 3 days</small></span>
-            <ArrowRight size={16} className="attention-arrow" />
-          </button>
-          <button className="attention-item" onClick={() => onNavigate("Daily closing")}>
-            <span className="attention-symbol symbol-cyan"><Wallet size={17} /></span>
-            <span className="attention-copy"><strong>Closing not completed</strong><small>Yesterday's cash count is missing</small></span>
-            <ArrowRight size={16} className="attention-arrow" />
-          </button>
+
+          {stock.withMiddleman > 0 && (
+            <button
+              className="attention-item"
+              onClick={() => onNavigate("Custody")}
+            >
+              <span className="attention-symbol symbol-violet">
+                <ArrowUpRight size={17} />
+              </span>
+              <span className="attention-copy">
+                <strong>Middle-man follow-up</strong>
+                <small>{stock.withMiddleman} stock units away</small>
+              </span>
+              <ArrowRight size={16} className="attention-arrow" />
+            </button>
+          )}
+
+          {stock.atRepairer > 0 && (
+            <button
+              className="attention-item"
+              onClick={() => onNavigate("Repairs")}
+            >
+              <span className="attention-symbol symbol-amber">
+                <WrenchIcon size={17} />
+              </span>
+              <span className="attention-copy">
+                <strong>Repair tracking</strong>
+                <small>{stock.atRepairer} stock units at repairers</small>
+              </span>
+              <ArrowRight size={16} className="attention-arrow" />
+            </button>
+          )}
+
+          {followUpCount === 0 && (
+            <div className="inventory-empty">
+              <CircleAlert size={22} />
+              <strong>No stock follow-ups</strong>
+              <span>No devices are currently marked away.</span>
+            </div>
+          )}
+
+          <div className="stock-note">
+            <div className="stock-note-icon">
+              <Wallet size={16} />
+            </div>
+            <div>
+              <strong>Cash closing</strong>
+              <span>Daily closing records are not connected yet.</span>
+            </div>
+          </div>
         </article>
       </section>
 
       <section className="devices-section surface-card">
         <div className="card-heading">
           <div>
-            <div className="card-kicker">RECENTLY UPDATED</div>
-            <h2>Phone inventory</h2>
+            <div className="card-kicker">INVENTORY RECORDS</div>
+            <h2>Recently added stock</h2>
           </div>
-          <button className="text-button" onClick={() => onNavigate("Inventory")}>View inventory <ArrowRight size={15} /></button>
+          <button
+            className="text-button"
+            onClick={() => onNavigate("Inventory")}
+          >
+            View inventory <ArrowRight size={15} />
+          </button>
         </div>
-        <div className="table-wrap">
-          <table className="inventory-table">
-            <thead><tr><th>DEVICE</th><th>IDENTIFIER</th><th>STATUS</th><th>APPROVED PRICE</th><th>UPDATED</th><th /></tr></thead>
-            <tbody>
-              {demoDevices.map((device) => (
-                <tr key={device.id}>
-                  <td><div className="device-cell"><div className="device-thumbnail"><Smartphone size={18} /></div><div><strong>{device.model}</strong><span>{device.variant}</span></div></div></td>
-                  <td className="identifier-cell">{device.identifier}</td>
-                  <td><span className={`status-pill status-${device.status === "In shop" ? "available" : device.status === "With middle-man" ? "custody" : "repair"}`}><i />{device.status}</span></td>
-                  <td className="price-cell">{formatUGX(device.approvedPrice)}</td>
-                  <td className="updated-cell">{device.updated}</td>
-                  <td><button className="row-more" aria-label={`Open ${device.model}`} onClick={() => onNavigate("Inventory")}>···</button></td>
+
+        {recentInventory.length === 0 ? (
+          <div className="inventory-empty">
+            <Package size={24} />
+            <strong>No inventory records yet</strong>
+            <span>Add stock to see your inventory here.</span>
+          </div>
+        ) : (
+          <div className="table-wrap">
+            <table className="inventory-table">
+              <thead>
+                <tr>
+                  <th>ITEM</th>
+                  <th>IDENTIFIER</th>
+                  <th>STATUS</th>
+                  <th>SELLING PRICE</th>
+                  <th>UPDATED</th>
+                  <th />
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {recentInventory.map((item) => (
+                  <tr key={item.id}>
+                    <td>
+                      <div className="device-cell">
+                        <div className="device-thumbnail">
+                          {item.category === "Accessory / spare part" ? (
+                            <Package size={18} />
+                          ) : (
+                            <Smartphone size={18} />
+                          )}
+                        </div>
+                        <div>
+                          <strong>{item.brand} {item.model}</strong>
+                          <span>
+                            {item.category === "Accessory / spare part"
+                              ? `Accessory · Qty ${item.quantity ?? 1}`
+                              : item.storage ?? "Device"}
+                          </span>
+                        </div>
+                      </div>
+                    </td>
+                    <td className="identifier-cell">{item.identifier}</td>
+                    <td>
+                      <span className={`status-pill status-${getStatusClass(item.status)}`}>
+                        <i />{item.status}
+                      </span>
+                    </td>
+                    <td className="price-cell">
+                      {formatUGX(Number(item.sellingPrice) || 0)}
+                    </td>
+                    <td className="updated-cell">{item.updated}</td>
+                    <td>
+                      <button
+                        className="row-more"
+                        aria-label={`Open ${item.model}`}
+                        onClick={() => onNavigate("Inventory")}
+                      >
+                        ···
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <div className="table-footnote">
+          <span>
+            <CircleAlert size={14} /> Data shown comes from this browser's inventory records.
+          </span>
+          <button
+            className="text-button"
+            onClick={() => onNavigate("Inventory")}
+          >
+            Open full inventory <ArrowRight size={15} />
+          </button>
         </div>
-        <div className="table-footnote"><span><CircleAlert size={14} /> Identifiers are masked fictional demo values.</span><button className="text-button" onClick={() => onNavigate("Inventory")}>Open full inventory <ArrowRight size={15} /></button></div>
       </section>
 
-      <div className="prototype-disclaimer">StockPilot prototype · All names, values and activity are fictional demonstration data.</div>
+      <div className="prototype-disclaimer">
+        StockPilot prototype · Dashboard figures are calculated from locally stored inventory and sales records.
+      </div>
     </div>
   );
 }
-
