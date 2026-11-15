@@ -1,6 +1,7 @@
 
 import { useRef } from "react";
 import {
+  CURRENCY_OPTIONS,
   formatMoneyInput,
   type CurrencyCode,
 } from "../utils/currency";
@@ -11,6 +12,7 @@ type CurrencyInputProps = {
   currencyCode: CurrencyCode;
   placeholder?: string;
   className?: string;
+  style?: React.CSSProperties;
   disabled?: boolean;
   required?: boolean;
   ariaLabel?: string;
@@ -22,11 +24,17 @@ export default function CurrencyInput({
   currencyCode,
   placeholder = "Enter amount",
   className,
+  style,
   disabled = false,
   required = false,
   ariaLabel = "Amount",
 }: CurrencyInputProps) {
   const inputRef = useRef<HTMLInputElement>(null);
+
+  const decimalPlaces =
+    CURRENCY_OPTIONS.find(
+      (currency) => currency.code === currencyCode
+    )?.decimalPlaces ?? 2;
 
   const displayValue = formatMoneyInput(value, currencyCode);
 
@@ -37,10 +45,8 @@ export default function CurrencyInput({
 
     const charactersBeforeCursor = originalValue
       .slice(0, cursorPosition)
-      .replace(/,/g, "").replace(/[^\d.]/g, "").length;
-
-    const decimalPlaces =
-      currencyCode === "USD" ? 2 : currencyCode === "KWD" ? 3 : 0;
+      .replace(/,/g, "")
+      .replace(/[^\d.]/g, "").length;
 
     const cleaned = originalValue
       .replace(/,/g, "")
@@ -85,11 +91,12 @@ export default function CurrencyInput({
     <input
       ref={inputRef}
       type="text"
-      inputMode={currencyCode === "UGX" ? "numeric" : "decimal"}
+      inputMode={decimalPlaces === 0 ? "numeric" : "decimal"}
       value={displayValue}
       onChange={handleChange}
       placeholder={placeholder}
       className={className}
+      style={style}
       disabled={disabled}
       required={required}
       aria-label={ariaLabel}
