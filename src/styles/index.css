@@ -1045,3 +1045,314 @@ h2 { margin: 0; color: var(--text); font-size: 14px; font-weight: 650; letter-sp
     padding: 17px;
   }
 }
+
+/* Supplier & Credit Management */
+
+.credit-page {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+.credit-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.credit-summary-card {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 20px;
+  min-width: 0;
+}
+
+.credit-summary-card > span,
+.credit-amount-grid span {
+  color: var(--text-secondary, #9299aa);
+  font-size: 12px;
+}
+
+.credit-summary-card > strong {
+  font-size: clamp(17px, 2vw, 23px);
+  overflow-wrap: anywhere;
+}
+
+.credit-summary-card small {
+  color: var(--text-secondary, #9299aa);
+  font-size: 11px;
+}
+
+.credit-summary-icon,
+.credit-record-icon {
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  background: rgba(100, 116, 139, 0.13);
+  color: #9ba9c4;
+}
+
+.credit-summary-icon.payable,
+.credit-record-icon.payable {
+  background: rgba(239, 100, 100, 0.12);
+  color: #ed8585;
+}
+
+.credit-summary-icon.receivable,
+.credit-record-icon.receivable {
+  background: rgba(59, 130, 246, 0.13);
+  color: #76aaff;
+}
+
+.credit-summary-icon.overdue {
+  background: rgba(239, 100, 100, 0.12);
+  color: #ed8585;
+}
+
+.credit-workspace {
+  padding: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.credit-entry-form {
+  padding: 20px;
+  border: 1px solid var(--border-color, rgba(148, 163, 184, 0.16));
+  border-radius: 14px;
+  background: rgba(100, 116, 139, 0.045);
+}
+
+.credit-form-type,
+.credit-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.credit-form-type button,
+.credit-tabs button {
+  border: 1px solid var(--border-color, rgba(148, 163, 184, 0.2));
+  border-radius: 9px;
+  padding: 9px 13px;
+  background: transparent;
+  color: var(--text-secondary, #9299aa);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+}
+
+.credit-form-type button.is-active,
+.credit-tabs button.is-active {
+  color: var(--text-primary, #fff);
+  border-color: rgba(83, 137, 255, 0.55);
+  background: rgba(59, 130, 246, 0.13);
+}
+
+.credit-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 20px;
+}
+
+.credit-description-field {
+  grid-column: span 2;
+}
+
+.credit-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 20px;
+}
+
+.credit-record-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.credit-record {
+  padding: 18px;
+  border: 1px solid var(--border-color, rgba(148, 163, 184, 0.16));
+  border-radius: 13px;
+  background: rgba(100, 116, 139, 0.035);
+}
+
+.credit-record-top,
+.credit-record-party,
+.credit-record-details,
+.credit-payment-history > div {
+  display: flex;
+  align-items: center;
+}
+
+.credit-record-top {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.credit-record-party {
+  gap: 12px;
+  min-width: 0;
+}
+
+.credit-record-party > div:last-child {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.credit-record-party strong {
+  font-size: 14px;
+}
+
+.credit-record-party span,
+.credit-record-details {
+  color: var(--text-secondary, #9299aa);
+  font-size: 11px;
+}
+
+.credit-record-details {
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  margin-top: 14px;
+}
+
+.credit-status {
+  padding: 5px 9px;
+  border-radius: 20px;
+  font-size: 10px;
+  white-space: nowrap;
+  background: rgba(148, 163, 184, 0.12);
+  color: #aab2c2;
+}
+
+.credit-status.paid {
+  background: rgba(34, 197, 94, 0.12);
+  color: #5ed69a;
+}
+
+.credit-status.partpaid {
+  background: rgba(59, 130, 246, 0.13);
+  color: #76aaff;
+}
+
+.credit-status.overdue {
+  background: rgba(239, 100, 100, 0.13);
+  color: #ed8585;
+}
+
+.credit-amount-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 18px;
+  padding-top: 15px;
+  border-top: 1px solid var(--border-color, rgba(148, 163, 184, 0.13));
+}
+
+.credit-amount-grid > div {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+}
+
+.credit-amount-grid strong {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.credit-amount-grid .credit-balance {
+  color: #82adff;
+}
+
+.credit-payment-history {
+  margin-top: 16px;
+  padding: 13px;
+  border-radius: 10px;
+  background: rgba(100, 116, 139, 0.07);
+}
+
+.credit-payment-history > strong {
+  display: block;
+  margin-bottom: 10px;
+  font-size: 12px;
+}
+
+.credit-payment-history > div {
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 0;
+  color: var(--text-secondary, #9299aa);
+  font-size: 11px;
+}
+
+.credit-payment-history > div + div {
+  border-top: 1px solid var(--border-color, rgba(148, 163, 184, 0.12));
+}
+
+.credit-payment-history > div strong {
+  color: var(--text-primary, #fff);
+}
+
+.credit-payment-actions {
+  margin-top: 15px;
+}
+
+.credit-payment-form {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.credit-payment-form .inventory-field {
+  flex: 1 1 160px;
+}
+
+@media (max-width: 900px) {
+  .credit-summary-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 600px) {
+  .credit-workspace {
+    padding: 15px;
+  }
+
+  .credit-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .credit-description-field {
+    grid-column: auto;
+  }
+
+  .credit-amount-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .credit-form-actions {
+    flex-direction: column;
+  }
+
+  .credit-form-actions button {
+    width: 100%;
+  }
+
+  .credit-record-top {
+    align-items: flex-start;
+  }
+
+  .credit-payment-form {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}

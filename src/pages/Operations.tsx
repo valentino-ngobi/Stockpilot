@@ -1,4 +1,5 @@
 import DailyClosing from "./DailyClosing";
+import SupplierCredit from "./SupplierCredit";
 import { useEffect, useMemo, useState } from "react";
 import {
   ArrowLeftRight,
@@ -844,8 +845,12 @@ export default function Operations({ page }: { page: PageKey }) {
   );
   const [notice, setNotice] = useState("");
 
- if (page === "Daily closing") {
+if (page === "Daily closing") {
   return <DailyClosing />;
+}
+
+if (page === "Suppliers & credit") {
+  return <SupplierCredit />;
 }
 
 if (page === "Reports") {
