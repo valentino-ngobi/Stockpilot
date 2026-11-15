@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   CalendarClock,
   CheckCircle2,
+  Package,
   Receipt,
   Search,
   ShoppingCart,
@@ -10,15 +11,18 @@ import {
   XCircle,
 } from "lucide-react";
 
+type ItemCategory = "Device" | "Accessory / spare part";
+
 type DeviceRecord = {
   id: string;
   brand: string;
   model: string;
   identifier: string;
   status: "In shop" | "With middle-man" | "At repairer" | "Sold";
-   category?: "Device" | "Accessory / spare part";
+  category?: ItemCategory;
   costPrice?: string;
   sellingPrice?: string;
+  quantity?: number;
   secondaryIdentifiers?: string[];
   updated: string;
 };
@@ -38,6 +42,9 @@ type SaleRecord = {
   paymentMethod: PaymentMethod;
   transactionDate: string;
   costPrice: number;
+  category?: ItemCategory;
+  quantitySold?: number;
+  unitPrice?: number;
 };
 
 const INVENTORY_KEY = "stockpilot-inventory";
@@ -46,7 +53,7 @@ const SALES_KEY = "stockpilot-sales";
 function readInventory(): DeviceRecord[] {
   try {
     const saved = localStorage.getItem(INVENTORY_KEY);
-    return saved ? JSON.parse(saved) as DeviceRecord[] : [];
+    return saved ? (JSON.parse(saved) as DeviceRecord[]) : [];
   } catch {
     return [];
   }
@@ -55,10 +62,22 @@ function readInventory(): DeviceRecord[] {
 function readSales(): SaleRecord[] {
   try {
     const saved = localStorage.getItem(SALES_KEY);
-    return saved ? JSON.parse(saved) as SaleRecord[] : [];
+    return saved ? (JSON.parse(saved) as SaleRecord[]) : [];
   } catch {
     return [];
   }
+}
+
+function formatMoney(amount: number) {
+  return new Intl.NumberFormat("en-UG", {
+    style: "currency",
+    currency: "UGX",
+    maximumFractionDigits: 0,
+  }).format(amount);
+}
+
+function isAccessory(item: DeviceRecord) {
+  return item.category === "Accessory / spare part";
 }
 
 export default function Sales() {
@@ -67,6 +86,7 @@ export default function Sales() {
   const [search, setSearch] = useState("");
   const [selectedId, setSelectedId] = useState("");
   const [salePrice, setSalePrice] = useState("");
+  const [quantity, setQuantity] = useState("1");
   const [paymentMethod, setPaymentMethod] =
     useState<PaymentMethod>("Cash");
   const [transactionDate, setTransactionDate] = useState(
@@ -74,24 +94,38 @@ export default function Sales() {
   );
   const [notice, setNotice] = useState("");
 
-  const availableDevices = useMemo(
-    () => devices.filter(
-      (device) =>
-        device.status === "In shop" &&
-        (device.category === undefined || device.category === "Device")
-    ),
+  const availableItems = useMemo(
+    () =>
+      devices.filter(
+        (item) => item.status === "In shop"
+      ),
     [devices]
   );
 
-  const filteredDevices = availableDevices.filter((device) =>
-    `${device.brand} ${device.model} ${device.identifier}`
+  const filteredItems = availableItems.filter((item) =>
+    `${item.brand} ${item.model} ${item.identifier}`
       .toLowerCase()
       .includes(search.toLowerCase())
   );
 
-  const selectedDevice = availableDevices.find(
-    (device) => device.id === selectedId
+  const selectedItem = availableItems.find(
+    (item) => item.id === selectedId
   );
+
+  const selectedIsAccessory = selectedItem
+    ? isAccessory(selectedItem)
+    : false;
+
+  const availableQuantity = selectedItem && selectedIsAccessory
+    ? Math.max(0, Number(selectedItem.quantity) || 0)
+    : 1;
+
+  const requestedQuantity = selectedIsAccessory
+    ? Math.max(0, Number(quantity) || 0)
+    : 1;
+
+  const totalPrice =
+    (Number(salePrice) || 0) * requestedQuantity;
 
   useEffect(() => {
     try {
@@ -101,76 +135,134 @@ export default function Sales() {
     }
   }, [sales]);
 
-  const formatMoney = (amount: number) =>
-    new Intl.NumberFormat("en-UG", {
-      style: "currency",
-      currency: "UGX",
-      maximumFractionDigits: 0,
-    }).format(amount);
-
   const handleSale = () => {
     setNotice("");
 
-    if (!selectedDevice) {
-      setNotice("Select an available device before recording a sale.");
+    if (!selectedItem) {
+      setNotice("Select an available item before recording a sale.");
       return;
     }
 
-    const price = Number(salePrice);
+    const unitPrice = Number(salePrice);
 
-    if (!Number.isFinite(price) || price <= 0) {
+    if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
       setNotice("Enter a valid selling price greater than zero.");
       return;
     }
 
-    if (!transactionDate || Number.isNaN(new Date(transactionDate).getTime())) {
+    const saleQuantity = isAccessory(selectedItem)
+      ? Number(quantity)
+      : 1;
+
+    if (
+      !Number.isInteger(saleQuantity) ||
+      saleQuantity <= 0
+    ) {
+      setNotice("Enter a valid whole-number quantity.");
+      return;
+    }
+
+    if (
+      !transactionDate ||
+      Number.isNaN(new Date(transactionDate).getTime())
+    ) {
       setNotice("Enter a valid transaction date and time.");
       return;
     }
 
-    // Re-read inventory to avoid selling a device that has changed status.
+    // Re-read the latest inventory before completing the sale.
     const latestDevices = readInventory();
-    const latestDevice = latestDevices.find(
-      (device) => device.id === selectedDevice.id
+    const latestItem = latestDevices.find(
+      (item) => item.id === selectedItem.id
     );
 
-    if (!latestDevice || latestDevice.status !== "In shop") {
+    if (!latestItem || latestItem.status !== "In shop") {
       setDevices(latestDevices);
       setSelectedId("");
-      setNotice("This device is no longer available. Refresh your selection.");
+      setNotice("This item is no longer available. Refresh your selection.");
       return;
     }
 
+    const accessory = isAccessory(latestItem);
+    const currentQuantity = accessory
+      ? Math.max(0, Number(latestItem.quantity) || 0)
+      : 1;
+
+    if (saleQuantity > currentQuantity) {
+      setDevices(latestDevices);
+      setNotice(
+        `Insufficient stock. Only ${currentQuantity} unit(s) are available.`
+      );
+      return;
+    }
+
+    const unitCost = Number(latestItem.costPrice) || 0;
+    const saleTotal = unitPrice * saleQuantity;
+    const costTotal = unitCost * saleQuantity;
+
     const sale: SaleRecord = {
       id: `SALE-${Date.now()}`,
-      deviceId: latestDevice.id,
-      deviceName: `${latestDevice.brand} ${latestDevice.model}`,
-      identifier: latestDevice.identifier,
-      salePrice: price,
+      deviceId: latestItem.id,
+      deviceName: `${latestItem.brand} ${latestItem.model}`,
+      identifier: latestItem.identifier,
+      salePrice: saleTotal,
       paymentMethod,
       transactionDate: new Date(transactionDate).toISOString(),
-      costPrice: Number(latestDevice.costPrice) || 0,
+      costPrice: costTotal,
+      category: accessory ? "Accessory / spare part" : "Device",
+      quantitySold: saleQuantity,
+      unitPrice,
     };
 
-    const updatedDevices = latestDevices.map((device) =>
-      device.id === latestDevice.id
-        ? { ...device, status: "Sold" as const, updated: "Just now" }
-        : device
-    );
+    const updatedDevices = latestDevices.map((item) => {
+      if (item.id !== latestItem.id) return item;
+
+      if (accessory) {
+        const remainingQuantity = currentQuantity - saleQuantity;
+
+        return {
+          ...item,
+          quantity: remainingQuantity,
+          status: remainingQuantity === 0
+            ? "Sold" as const
+            : "In shop" as const,
+          updated: "Just now",
+        };
+      }
+
+      return {
+        ...item,
+        status: "Sold" as const,
+        updated: "Just now",
+      };
+    });
+
+    const updatedSales = [sale, ...readSales()];
 
     try {
-      localStorage.setItem(INVENTORY_KEY, JSON.stringify(updatedDevices));
-
-      const updatedSales = [sale, ...readSales()];
-      localStorage.setItem(SALES_KEY, JSON.stringify(updatedSales));
+      // Save both records together as far as browser storage allows.
+      localStorage.setItem(
+        INVENTORY_KEY,
+        JSON.stringify(updatedDevices)
+      );
+      localStorage.setItem(
+        SALES_KEY,
+        JSON.stringify(updatedSales)
+      );
 
       setDevices(updatedDevices);
       setSales(updatedSales);
       setSelectedId("");
       setSalePrice("");
-      setTransactionDate(new Date().toISOString().slice(0, 16));
+      setQuantity("1");
       setPaymentMethod("Cash");
-      setNotice("Sale recorded successfully. Inventory status updated to Sold.");
+      setTransactionDate(new Date().toISOString().slice(0, 16));
+
+      setNotice(
+        accessory
+          ? `Sale recorded. ${saleQuantity} unit(s) sold successfully.`
+          : "Sale recorded successfully. Inventory status updated to Sold."
+      );
     } catch (error) {
       console.error("Could not complete sale:", error);
       setNotice("Could not save the sale. Check browser storage and try again.");
@@ -187,7 +279,7 @@ export default function Sales() {
         <div>
           <h1>Sales & checkout</h1>
           <p className="page-subtitle">
-            Record device sales and keep your inventory up to date.
+            Sell phones, accessories and spare parts while keeping stock updated.
           </p>
         </div>
         <div className="operations-heading-icon">
@@ -198,60 +290,97 @@ export default function Sales() {
       <div className="operations-grid">
         <section className="surface-card operations-form-card">
           <div className="card-kicker">NEW TRANSACTION</div>
-          <h2>Record a device sale</h2>
+          <h2>Record a sale</h2>
 
           <div className="operations-form">
             <label className="inventory-field">
-              <span>Find available device</span>
+              <span>Find available item</span>
               <div className="inventory-list-search">
                 <Search size={16} />
                 <input
                   value={search}
                   onChange={(event) => setSearch(event.target.value)}
-                  placeholder="Search model or IMEI"
+                  placeholder="Search phone, accessory or identifier"
                 />
               </div>
             </label>
 
             <label className="inventory-field">
-              <span>Select device</span>
+              <span>Select item</span>
               <select
                 value={selectedId}
                 onChange={(event) => {
                   const id = event.target.value;
                   setSelectedId(id);
-                  const device = availableDevices.find((item) => item.id === id);
-                  setSalePrice(device?.sellingPrice ?? "");
+                  const item = availableItems.find(
+                    (record) => record.id === id
+                  );
+                  setSalePrice(item?.sellingPrice ?? "");
+                  setQuantity("1");
                 }}
               >
-                <option value="">Choose a device</option>
-                {filteredDevices.map((device) => (
-                  <option key={device.id} value={device.id}>
-                    {device.brand} {device.model} — {device.identifier}
+                <option value="">Choose an item</option>
+                {filteredItems.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {isAccessory(item) ? "[Accessory]" : "[Device]"}{" "}
+                    {item.brand} {item.model} — {item.identifier}
+                    {isAccessory(item)
+                      ? ` (${item.quantity ?? 0} available)`
+                      : ""}
                   </option>
                 ))}
               </select>
-              {availableDevices.length === 0 && (
+
+              {availableItems.length === 0 && (
                 <small className="field-hint">
-                  No available devices. Receive stock into Inventory first.
+                  No available items. Receive stock into Inventory first.
                 </small>
               )}
             </label>
 
-            {selectedDevice && (
+            {selectedItem && (
               <div className="inventory-info-banner surface-card">
-                <Smartphone size={19} />
+                {selectedIsAccessory ? (
+                  <Package size={19} />
+                ) : (
+                  <Smartphone size={19} />
+                )}
                 <div>
                   <strong>
-                    {selectedDevice.brand} {selectedDevice.model}
+                    {selectedItem.brand} {selectedItem.model}
                   </strong>
-                  <p>{selectedDevice.identifier}</p>
+                  <p>{selectedItem.identifier}</p>
+                  {selectedIsAccessory && (
+                    <p>{availableQuantity} unit(s) currently available</p>
+                  )}
                 </div>
               </div>
             )}
 
+            {selectedIsAccessory && (
+              <label className="inventory-field">
+                <span>Quantity to sell</span>
+                <input
+                  type="number"
+                  min="1"
+                  max={availableQuantity}
+                  step="1"
+                  value={quantity}
+                  onChange={(event) => setQuantity(event.target.value)}
+                  placeholder="Enter quantity"
+                />
+                <small className="field-hint">
+                  Available stock: {availableQuantity} unit(s)
+                </small>
+              </label>
+            )}
+
             <label className="inventory-field">
-              <span>Selling price (UGX)</span>
+              <span>
+                {selectedIsAccessory
+                  ? "Selling price per unit (UGX)"
+                  : "Selling price (UGX)"}
+              </span>
               <input
                 type="number"
                 min="1"
@@ -261,6 +390,16 @@ export default function Sales() {
                 placeholder="Enter actual sale price"
               />
             </label>
+
+            {selectedIsAccessory && (
+              <div className="inventory-info-banner surface-card">
+                <Receipt size={18} />
+                <div>
+                  <strong>Transaction total</strong>
+                  <p>{formatMoney(totalPrice)}</p>
+                </div>
+              </div>
+            )}
 
             <label className="inventory-field">
               <span>Payment method</span>
@@ -289,7 +428,7 @@ export default function Sales() {
 
           {notice && (
             <p className="operations-notice" role="status">
-              {notice.includes("successfully") ? (
+              {notice.includes("recorded") || notice.includes("successfully") ? (
                 <CheckCircle2 size={15} />
               ) : (
                 <XCircle size={15} />
@@ -298,7 +437,14 @@ export default function Sales() {
             </p>
           )}
 
-          <button className="button button-primary" onClick={handleSale}>
+          <button
+            className="button button-primary"
+            onClick={handleSale}
+            disabled={
+              selectedIsAccessory &&
+              requestedQuantity > availableQuantity
+            }
+          >
             <ShoppingCart size={16} />
             Complete sale
           </button>
@@ -329,15 +475,26 @@ export default function Sales() {
               {sales.map((sale) => (
                 <article className="operations-record" key={sale.id}>
                   <div className="operations-record-icon">
-                    <Receipt size={17} />
+                    {sale.category === "Accessory / spare part" ? (
+                      <Package size={17} />
+                    ) : (
+                      <Receipt size={17} />
+                    )}
                   </div>
                   <div className="operations-record-copy">
                     <strong>{sale.deviceName}</strong>
                     <span>{sale.identifier}</span>
+                    {sale.category === "Accessory / spare part" && (
+                      <span>
+                        Accessory · Qty {sale.quantitySold ?? 1}
+                      </span>
+                    )}
                     <span>
                       {new Date(sale.transactionDate).toLocaleString()}
                     </span>
-                    <span>{sale.paymentMethod} · {sale.id}</span>
+                    <span>
+                      {sale.paymentMethod} · {sale.id}
+                    </span>
                   </div>
                   <strong className="operations-amount">
                     {formatMoney(sale.salePrice)}
@@ -350,8 +507,8 @@ export default function Sales() {
           <div className="operations-note">
             <CalendarClock size={16} />
             <span>
-              {devices.filter((device) => device.status === "In shop").length}
-              {" "}devices currently available for sale.
+              {devices.filter((item) => item.status === "In shop").length}
+              {" "}items currently available for sale.
             </span>
           </div>
         </section>
