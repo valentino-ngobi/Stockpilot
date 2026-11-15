@@ -7,6 +7,14 @@ import {
   ShoppingCart,
   Truck,
 } from "lucide-react";
+import CurrencyInput from "../components/CurrencyInput";
+import {
+  CURRENCY_OPTIONS,
+  formatCurrency,
+  getRecordCurrency,
+  getShopCurrency,
+  type CurrencyCode,
+} from "../utils/currency";
 
 type ProductCategory = "Device" | "Accessory / spare part";
 type PurchaseStatus = "Draft" | "Received";
@@ -39,6 +47,7 @@ type PurchaseRecord = {
   initialPayment: number;
   createdAt: string;
   receivedAt?: string;
+  currencyCode?: CurrencyCode;
 };
 
 type InventoryRecord = {
@@ -57,6 +66,7 @@ type InventoryRecord = {
   quantity?: number;
   secondaryIdentifiers?: string[];
   updated: string;
+  currencyCode?: CurrencyCode;
 };
 
 type CreditPayment = {
@@ -77,6 +87,7 @@ type CreditRecord = {
   createdAt: string;
   payments: CreditPayment[];
   purchaseId?: string;
+  currencyCode?: CurrencyCode;
 };
 
 const PURCHASES_KEY = "stockpilot-purchases";
@@ -96,9 +107,6 @@ const emptyItem = {
   sellingPrice: "",
   identifiers: "",
 };
-
-const money = (amount: number) =>
-  new Intl.NumberFormat("en-UG").format(amount);
 
 function readStorage<T>(key: string, fallback: T): T {
   try {
@@ -128,6 +136,9 @@ export default function Purchases() {
   );
   const [dueDate, setDueDate] = useState("");
   const [initialPayment, setInitialPayment] = useState("0");
+  const [invoiceCurrency, setInvoiceCurrency] = useState<CurrencyCode>(
+    () => getShopCurrency()
+  );
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
@@ -161,6 +172,8 @@ export default function Purchases() {
   const draftCount = purchases.filter(
     (purchase) => purchase.status === "Draft"
   ).length;
+
+  const selectedCurrency = getRecordCurrency(invoiceCurrency);
 
   const addItem = () => {
     setError("");
@@ -283,6 +296,7 @@ export default function Purchases() {
       total: purchaseTotal,
       initialPayment: paid,
       createdAt: new Date().toISOString(),
+      currencyCode: selectedCurrency,
     };
 
     setPurchases((current) => [purchase, ...current]);
@@ -294,7 +308,11 @@ export default function Purchases() {
     setDueDate("");
     setInitialPayment("0");
     setItems([]);
-    setMessage("Purchase draft saved. Inventory has not been changed.");
+    setInvoiceCurrency(getShopCurrency());
+
+    setMessage(
+      `Purchase draft saved in ${selectedCurrency}. Inventory has not been changed.`
+    );
   };
 
   const receivePurchase = (purchase: PurchaseRecord) => {
@@ -305,6 +323,8 @@ export default function Purchases() {
       setError("This purchase has already been received.");
       return;
     }
+
+    const purchaseCurrency = getRecordCurrency(purchase.currencyCode);
 
     const inventory = readStorage<InventoryRecord[]>(INVENTORY_KEY, []);
     const credits = readStorage<CreditRecord[]>(CREDIT_KEY, []);
@@ -330,6 +350,17 @@ export default function Purchases() {
       }
     }
 
+    const alreadyLinked = credits.some(
+      (credit) => credit.purchaseId === purchase.id
+    );
+
+    if (alreadyLinked) {
+      setError(
+        "A supplier credit record already exists for this purchase. Please check the credit ledger before trying again."
+      );
+      return;
+    }
+
     for (const item of purchase.items) {
       if (item.category === "Device") {
         for (const identifier of item.identifiers) {
@@ -349,20 +380,25 @@ export default function Purchases() {
             quantity: 1,
             secondaryIdentifiers: [],
             updated: "Just now",
+            currencyCode: purchaseCurrency,
           });
         }
       } else {
         const sku = item.identifiers[0] || item.model;
 
-        const existingIndex = updatedInventory.findIndex(
-          (record) =>
+        const existingIndex = updatedInventory.findIndex((record) => {
+          const recordCurrency = getRecordCurrency(record.currencyCode);
+
+          return (
             record.category === "Accessory / spare part" &&
             record.brand.toLowerCase() === item.brand.toLowerCase() &&
             record.model.toLowerCase() === item.model.toLowerCase() &&
             (record.identifier || record.model).toLowerCase() ===
               sku.toLowerCase() &&
-            record.status !== "Sold"
-        );
+            record.status !== "Sold" &&
+            recordCurrency === purchaseCurrency
+          );
+        });
 
         if (existingIndex >= 0) {
           const existing = updatedInventory[existingIndex];
@@ -378,8 +414,11 @@ export default function Purchases() {
             ...existing,
             quantity: newQuantity,
             costPrice: String(weightedCost),
-            sellingPrice: String(item.sellingPrice || existing.sellingPrice || 0),
+            sellingPrice: String(
+              item.sellingPrice || existing.sellingPrice || 0
+            ),
             status: "In shop",
+            currencyCode: purchaseCurrency,
             updated: "Just now",
           };
         } else {
@@ -397,20 +436,10 @@ export default function Purchases() {
             quantity: item.quantity,
             secondaryIdentifiers: [],
             updated: "Just now",
+            currencyCode: purchaseCurrency,
           });
         }
       }
-    }
-
-    const alreadyLinked = credits.some(
-      (credit) => credit.purchaseId === purchase.id
-    );
-
-    if (alreadyLinked) {
-      setError(
-        "A supplier credit record already exists for this purchase. Please check the credit ledger before trying again."
-      );
-      return;
     }
 
     const creditRecord: CreditRecord = {
@@ -434,6 +463,7 @@ export default function Purchases() {
             ]
           : [],
       purchaseId: purchase.id,
+      currencyCode: purchaseCurrency,
     };
 
     saveStorage(INVENTORY_KEY, updatedInventory);
@@ -446,13 +476,14 @@ export default function Purchases() {
               ...record,
               status: "Received",
               receivedAt: new Date().toISOString(),
+              currencyCode: purchaseCurrency,
             }
           : record
       )
     );
 
     setMessage(
-      `Stock received successfully. Inventory updated and supplier credit linked for ${purchase.supplier}.`
+      `Stock received successfully. Inventory updated and supplier credit linked for ${purchase.supplier} in ${purchaseCurrency}.`
     );
   };
 
@@ -530,7 +561,7 @@ export default function Purchases() {
         </div>
         <p style={{ color: "var(--muted, #a0a8b7)", fontSize: 13 }}>
           Record supplier invoices, receive products into inventory and track
-          supplier balances.
+          supplier balances in their original currencies.
         </p>
       </div>
 
@@ -595,7 +626,8 @@ export default function Purchases() {
           <h3 style={{ margin: 0 }}>New supplier purchase</h3>
         </div>
         <p style={{ color: "var(--muted, #a0a8b7)", fontSize: 12 }}>
-          Add the supplier invoice details, then add each product line.
+          Add the supplier invoice details, choose its currency, then add each
+          product line.
         </p>
 
         <div
@@ -654,6 +686,34 @@ export default function Purchases() {
               value={dueDate}
               onChange={(event) => setDueDate(event.target.value)}
             />
+          </label>
+
+          <label style={fieldStyle}>
+            <span style={labelStyle}>Invoice currency *</span>
+            <select
+              style={inputStyle}
+              value={invoiceCurrency}
+              onChange={(event) => {
+                setInvoiceCurrency(event.target.value);
+                setError("");
+                setMessage("");
+              }}
+            >
+              {CURRENCY_OPTIONS.map((currency) => (
+                <option key={currency.code} value={currency.code}>
+                  {currency.code} ({currency.decimalPlaces} decimal places)
+                </option>
+              ))}
+            </select>
+            <span
+              style={{
+                color: "var(--muted, #a0a8b7)",
+                fontSize: 11,
+              }}
+            >
+              Defaults to your shop currency, but can be changed for each
+              supplier invoice.
+            </span>
           </label>
         </div>
 
@@ -742,36 +802,39 @@ export default function Purchases() {
           </label>
 
           <label style={fieldStyle}>
-            <span style={labelStyle}>Unit purchase cost (UGX) *</span>
-            <input
+            <span style={labelStyle}>
+              Unit purchase cost ({selectedCurrency}) *
+            </span>
+            <CurrencyInput
               style={inputStyle}
-              type="number"
-              min="1"
               value={itemForm.unitCost}
-              onChange={(event) =>
+              onChange={(value) =>
                 setItemForm((current) => ({
                   ...current,
-                  unitCost: event.target.value,
+                  unitCost: value,
                 }))
               }
-              placeholder="450000"
+              currencyCode={selectedCurrency}
+              placeholder="Enter purchase cost"
+              required
             />
           </label>
 
           <label style={fieldStyle}>
-            <span style={labelStyle}>Unit selling price (UGX)</span>
-            <input
+            <span style={labelStyle}>
+              Unit selling price ({selectedCurrency})
+            </span>
+            <CurrencyInput
               style={inputStyle}
-              type="number"
-              min="0"
               value={itemForm.sellingPrice}
-              onChange={(event) =>
+              onChange={(value) =>
                 setItemForm((current) => ({
                   ...current,
-                  sellingPrice: event.target.value,
+                  sellingPrice: value,
                 }))
               }
-              placeholder="500000"
+              currencyCode={selectedCurrency}
+              placeholder="Enter selling price"
             />
           </label>
 
@@ -885,9 +948,20 @@ export default function Purchases() {
           <div style={{ marginTop: 22 }}>
             <h4>Invoice items</h4>
             <div style={{ overflowX: "auto" }}>
-              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+              <table
+                style={{
+                  width: "100%",
+                  borderCollapse: "collapse",
+                  fontSize: 12,
+                }}
+              >
                 <thead>
-                  <tr style={{ color: "var(--muted, #a0a8b7)", textAlign: "left" }}>
+                  <tr
+                    style={{
+                      color: "var(--muted, #a0a8b7)",
+                      textAlign: "left",
+                    }}
+                  >
                     <th style={{ padding: 9 }}>Product</th>
                     <th style={{ padding: 9 }}>Type</th>
                     <th style={{ padding: 9 }}>Qty</th>
@@ -898,24 +972,50 @@ export default function Purchases() {
                 </thead>
                 <tbody>
                   {items.map((item) => (
-                    <tr key={item.id} style={{ borderTop: "1px solid var(--border, #303744)" }}>
+                    <tr
+                      key={item.id}
+                      style={{
+                        borderTop: "1px solid var(--border, #303744)",
+                      }}
+                    >
                       <td style={{ padding: 9 }}>
-                        <strong>{item.brand} {item.model}</strong>
+                        <strong>
+                          {item.brand} {item.model}
+                        </strong>
                         {item.identifiers.length > 0 && (
-                          <div style={{ color: "var(--muted, #a0a8b7)", marginTop: 3 }}>
+                          <div
+                            style={{
+                              color: "var(--muted, #a0a8b7)",
+                              marginTop: 3,
+                            }}
+                          >
                             {item.identifiers.length} identifier(s)
                           </div>
                         )}
                       </td>
-                      <td style={{ padding: 9 }}>{item.category === "Device" ? "Device" : "Accessory"}</td>
+                      <td style={{ padding: 9 }}>
+                        {item.category === "Device" ? "Device" : "Accessory"}
+                      </td>
                       <td style={{ padding: 9 }}>{item.quantity}</td>
-                      <td style={{ padding: 9 }}>{money(item.unitCost)}</td>
-                      <td style={{ padding: 9 }}>{money(item.quantity * item.unitCost)}</td>
+                      <td style={{ padding: 9 }}>
+                        {formatCurrency(item.unitCost, selectedCurrency)}
+                      </td>
+                      <td style={{ padding: 9 }}>
+                        {formatCurrency(
+                          item.quantity * item.unitCost,
+                          selectedCurrency
+                        )}
+                      </td>
                       <td style={{ padding: 9 }}>
                         <button
                           type="button"
                           onClick={() => removeItem(item.id)}
-                          style={{ background: "transparent", color: "#f87171", border: 0, cursor: "pointer" }}
+                          style={{
+                            background: "transparent",
+                            color: "#f87171",
+                            border: 0,
+                            cursor: "pointer",
+                          }}
                         >
                           Remove
                         </button>
@@ -927,10 +1027,17 @@ export default function Purchases() {
             </div>
 
             <div style={{ textAlign: "right", marginTop: 14 }}>
-              <span style={{ color: "var(--muted, #a0a8b7)", fontSize: 12 }}>
-                Purchase total
+              <span
+                style={{
+                  color: "var(--muted, #a0a8b7)",
+                  fontSize: 12,
+                }}
+              >
+                Purchase total ({selectedCurrency})
               </span>
-              <h2 style={{ margin: "4px 0" }}>UGX {money(purchaseTotal)}</h2>
+              <h2 style={{ margin: "4px 0" }}>
+                {formatCurrency(purchaseTotal, selectedCurrency)}
+              </h2>
             </div>
           </div>
         )}
@@ -943,13 +1050,15 @@ export default function Purchases() {
         />
 
         <label style={{ ...fieldStyle, maxWidth: 300 }}>
-          <span style={labelStyle}>Amount already paid (UGX)</span>
-          <input
+          <span style={labelStyle}>
+            Amount already paid ({selectedCurrency})
+          </span>
+          <CurrencyInput
             style={inputStyle}
-            type="number"
-            min="0"
             value={initialPayment}
-            onChange={(event) => setInitialPayment(event.target.value)}
+            onChange={setInitialPayment}
+            currencyCode={selectedCurrency}
+            placeholder="Enter amount paid"
           />
         </label>
 
@@ -974,9 +1083,19 @@ export default function Purchases() {
             No purchases recorded yet.
           </p>
         ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: 12, marginTop: 16 }}>
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 12,
+              marginTop: 16,
+            }}
+          >
             {purchases.map((purchase) => {
               const payment = getPurchasePayment(purchase);
+              const purchaseCurrency = getRecordCurrency(
+                purchase.currencyCode
+              );
 
               return (
                 <div
@@ -997,28 +1116,47 @@ export default function Purchases() {
                   >
                     <div>
                       <strong>{purchase.supplier}</strong>
-                      <div style={{ color: "var(--muted, #a0a8b7)", fontSize: 11, marginTop: 4 }}>
-                        {purchase.invoiceReference || purchase.id} · {purchase.purchaseDate}
+                      <div
+                        style={{
+                          color: "var(--muted, #a0a8b7)",
+                          fontSize: 11,
+                          marginTop: 4,
+                        }}
+                      >
+                        {purchase.invoiceReference || purchase.id} ·{" "}
+                        {purchase.purchaseDate}
                       </div>
                     </div>
                     <div style={{ textAlign: "right" }}>
-                      <strong>UGX {money(purchase.total)}</strong>
+                      <strong>
+                        {formatCurrency(purchase.total, purchaseCurrency)}
+                      </strong>
                       <div
                         style={{
                           fontSize: 11,
                           marginTop: 4,
-                          color: purchase.status === "Received" ? "#4ade80" : "#fbbf24",
+                          color:
+                            purchase.status === "Received"
+                              ? "#4ade80"
+                              : "#fbbf24",
                         }}
                       >
-                        {purchase.status}
+                        {purchase.status} · {purchaseCurrency}
                       </div>
                     </div>
                   </div>
 
-                  <div style={{ marginTop: 12, fontSize: 12, color: "var(--muted, #a0a8b7)" }}>
+                  <div
+                    style={{
+                      marginTop: 12,
+                      fontSize: 12,
+                      color: "var(--muted, #a0a8b7)",
+                    }}
+                  >
                     {purchase.items.map((item) => (
                       <div key={item.id} style={{ padding: "3px 0" }}>
-                        {item.brand} {item.model} — {item.quantity} × UGX {money(item.unitCost)}
+                        {item.brand} {item.model} — {item.quantity} ×{" "}
+                        {formatCurrency(item.unitCost, purchaseCurrency)}
                       </div>
                     ))}
                   </div>
@@ -1034,8 +1172,13 @@ export default function Purchases() {
                       fontSize: 12,
                     }}
                   >
-                    <span>Paid: UGX {money(payment.paid)}</span>
-                    <span>Outstanding: UGX {money(payment.outstanding)}</span>
+                    <span>
+                      Paid: {formatCurrency(payment.paid, purchaseCurrency)}
+                    </span>
+                    <span>
+                      Outstanding:{" "}
+                      {formatCurrency(payment.outstanding, purchaseCurrency)}
+                    </span>
                   </div>
 
                   {purchase.status === "Draft" ? (
@@ -1044,11 +1187,23 @@ export default function Purchases() {
                       style={{ ...buttonStyle, marginTop: 14 }}
                       onClick={() => receivePurchase(purchase)}
                     >
-                      <PackageCheck size={15} style={{ verticalAlign: "middle", marginRight: 6 }} />
+                      <PackageCheck
+                        size={15}
+                        style={{
+                          verticalAlign: "middle",
+                          marginRight: 6,
+                        }}
+                      />
                       Confirm stock received
                     </button>
                   ) : (
-                    <div style={{ color: "#4ade80", fontSize: 11, marginTop: 12 }}>
+                    <div
+                      style={{
+                        color: "#4ade80",
+                        fontSize: 11,
+                        marginTop: 12,
+                      }}
+                    >
                       Stock received and supplier payable linked.
                     </div>
                   )}
