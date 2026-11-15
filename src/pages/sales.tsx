@@ -10,6 +10,12 @@ import {
   Smartphone,
   XCircle,
 } from "lucide-react";
+import {
+  formatCurrency,
+  getRecordCurrency,
+  getShopCurrency,
+  type CurrencyCode,
+} from "../utils/currency";
 
 type ItemCategory = "Device" | "Accessory / spare part";
 
@@ -24,6 +30,7 @@ type DeviceRecord = {
   sellingPrice?: string;
   quantity?: number;
   secondaryIdentifiers?: string[];
+  currencyCode?: CurrencyCode;
   updated: string;
 };
 
@@ -45,6 +52,7 @@ type SaleRecord = {
   category?: ItemCategory;
   quantitySold?: number;
   unitPrice?: number;
+  currencyCode?: CurrencyCode;
 };
 
 const INVENTORY_KEY = "stockpilot-inventory";
@@ -68,14 +76,6 @@ function readSales(): SaleRecord[] {
   }
 }
 
-function formatMoney(amount: number) {
-  return new Intl.NumberFormat("en-UG", {
-    style: "currency",
-    currency: "UGX",
-    maximumFractionDigits: 0,
-  }).format(amount);
-}
-
 function isAccessory(item: DeviceRecord) {
   return item.category === "Accessory / spare part";
 }
@@ -95,10 +95,7 @@ export default function Sales() {
   const [notice, setNotice] = useState("");
 
   const availableItems = useMemo(
-    () =>
-      devices.filter(
-        (item) => item.status === "In shop"
-      ),
+    () => devices.filter((item) => item.status === "In shop"),
     [devices]
   );
 
@@ -116,9 +113,14 @@ export default function Sales() {
     ? isAccessory(selectedItem)
     : false;
 
-  const availableQuantity = selectedItem && selectedIsAccessory
-    ? Math.max(0, Number(selectedItem.quantity) || 0)
-    : 1;
+  const saleCurrency = selectedItem
+    ? getRecordCurrency(selectedItem.currencyCode)
+    : getShopCurrency();
+
+  const availableQuantity =
+    selectedItem && selectedIsAccessory
+      ? Math.max(0, Number(selectedItem.quantity) || 0)
+      : 1;
 
   const requestedQuantity = selectedIsAccessory
     ? Math.max(0, Number(quantity) || 0)
@@ -179,7 +181,9 @@ export default function Sales() {
     if (!latestItem || latestItem.status !== "In shop") {
       setDevices(latestDevices);
       setSelectedId("");
-      setNotice("This item is no longer available. Refresh your selection.");
+      setNotice(
+        "This item is no longer available. Refresh your selection."
+      );
       return;
     }
 
@@ -199,6 +203,7 @@ export default function Sales() {
     const unitCost = Number(latestItem.costPrice) || 0;
     const saleTotal = unitPrice * saleQuantity;
     const costTotal = unitCost * saleQuantity;
+    const currencyCode = getRecordCurrency(latestItem.currencyCode);
 
     const sale: SaleRecord = {
       id: `SALE-${Date.now()}`,
@@ -212,6 +217,7 @@ export default function Sales() {
       category: accessory ? "Accessory / spare part" : "Device",
       quantitySold: saleQuantity,
       unitPrice,
+      currencyCode,
     };
 
     const updatedDevices = latestDevices.map((item) => {
@@ -240,7 +246,6 @@ export default function Sales() {
     const updatedSales = [sale, ...readSales()];
 
     try {
-      // Save both records together as far as browser storage allows.
       localStorage.setItem(
         INVENTORY_KEY,
         JSON.stringify(updatedDevices)
@@ -265,7 +270,9 @@ export default function Sales() {
       );
     } catch (error) {
       console.error("Could not complete sale:", error);
-      setNotice("Could not save the sale. Check browser storage and try again.");
+      setNotice(
+        "Could not save the sale. Check browser storage and try again."
+      );
     }
   };
 
@@ -350,6 +357,9 @@ export default function Sales() {
                     {selectedItem.brand} {selectedItem.model}
                   </strong>
                   <p>{selectedItem.identifier}</p>
+                  <p>
+                    Transaction currency: {saleCurrency}
+                  </p>
                   {selectedIsAccessory && (
                     <p>{availableQuantity} unit(s) currently available</p>
                   )}
@@ -378,13 +388,13 @@ export default function Sales() {
             <label className="inventory-field">
               <span>
                 {selectedIsAccessory
-                  ? "Selling price per unit (UGX)"
-                  : "Selling price (UGX)"}
+                  ? `Selling price per unit (${saleCurrency})`
+                  : `Selling price (${saleCurrency})`}
               </span>
               <input
                 type="number"
-                min="1"
-                step="1"
+                min="0"
+                step="any"
                 value={salePrice}
                 onChange={(event) => setSalePrice(event.target.value)}
                 placeholder="Enter actual sale price"
@@ -396,7 +406,7 @@ export default function Sales() {
                 <Receipt size={18} />
                 <div>
                   <strong>Transaction total</strong>
-                  <p>{formatMoney(totalPrice)}</p>
+                  <p>{formatCurrency(totalPrice, saleCurrency)}</p>
                 </div>
               </div>
             )}
@@ -472,35 +482,39 @@ export default function Sales() {
             </div>
           ) : (
             <div className="operations-record-list">
-              {sales.map((sale) => (
-                <article className="operations-record" key={sale.id}>
-                  <div className="operations-record-icon">
-                    {sale.category === "Accessory / spare part" ? (
-                      <Package size={17} />
-                    ) : (
-                      <Receipt size={17} />
-                    )}
-                  </div>
-                  <div className="operations-record-copy">
-                    <strong>{sale.deviceName}</strong>
-                    <span>{sale.identifier}</span>
-                    {sale.category === "Accessory / spare part" && (
+              {sales.map((sale) => {
+                const currencyCode = getRecordCurrency(sale.currencyCode);
+
+                return (
+                  <article className="operations-record" key={sale.id}>
+                    <div className="operations-record-icon">
+                      {sale.category === "Accessory / spare part" ? (
+                        <Package size={17} />
+                      ) : (
+                        <Receipt size={17} />
+                      )}
+                    </div>
+                    <div className="operations-record-copy">
+                      <strong>{sale.deviceName}</strong>
+                      <span>{sale.identifier}</span>
+                      {sale.category === "Accessory / spare part" && (
+                        <span>
+                          Accessory · Qty {sale.quantitySold ?? 1}
+                        </span>
+                      )}
                       <span>
-                        Accessory · Qty {sale.quantitySold ?? 1}
+                        {new Date(sale.transactionDate).toLocaleString()}
                       </span>
-                    )}
-                    <span>
-                      {new Date(sale.transactionDate).toLocaleString()}
-                    </span>
-                    <span>
-                      {sale.paymentMethod} · {sale.id}
-                    </span>
-                  </div>
-                  <strong className="operations-amount">
-                    {formatMoney(sale.salePrice)}
-                  </strong>
-                </article>
-              ))}
+                      <span>
+                        {sale.paymentMethod} · {sale.id}
+                      </span>
+                    </div>
+                    <strong className="operations-amount">
+                      {formatCurrency(sale.salePrice, currencyCode)}
+                    </strong>
+                  </article>
+                );
+              })}
             </div>
           )}
 
