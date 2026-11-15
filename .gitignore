@@ -6,3 +6,28 @@ dist
 .DS_Store
 *.log
 .vscode/settings.json
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Credentials and service accounts
+credentials.json
+service-account*.json
+
+# Local databases and backups
+*.sqlite
+*.sqlite3
+*.db
+*.bak
+
+# Local environment files
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+# Local data exports
+*.csv
+*.xlsx
+*.jsonl
