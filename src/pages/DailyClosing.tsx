@@ -1,13 +1,18 @@
 
 import { useEffect, useMemo, useState } from "react";
 import {
-  Banknote,
   CalendarClock,
   CheckCircle2,
   ClipboardCheck,
   History,
   Wallet,
 } from "lucide-react";
+import {
+  formatCurrency,
+  getRecordCurrency,
+  getShopCurrency,
+  type CurrencyCode,
+} from "../utils/currency";
 
 const SALES_KEY = "stockpilot-sales";
 const CLOSINGS_KEY = "stockpilot-daily-closings";
@@ -17,11 +22,11 @@ type SaleRecord = {
   salePrice: number;
   paymentMethod: string;
   transactionDate: string;
+  currencyCode?: CurrencyCode;
 };
 
-type ClosingRecord = {
-  id: string;
-  date: string;
+type CurrencyClosingSummary = {
+  currencyCode: CurrencyCode;
   openingCash: number;
   cashReceived: number;
   cashPaidOut: number;
@@ -31,7 +36,39 @@ type ClosingRecord = {
   totalSales: number;
   transactionCount: number;
   paymentTotals: Record<string, number>;
+};
+
+type ClosingRecord = {
+  id: string;
+  date: string;
   closedAt: string;
+  currencySummaries?: CurrencyClosingSummary[];
+
+  // Legacy fields retained for previously saved closings.
+  openingCash?: number;
+  cashReceived?: number;
+  cashPaidOut?: number;
+  expectedCash?: number;
+  actualCash?: number;
+  difference?: number;
+  totalSales?: number;
+  transactionCount?: number;
+  paymentTotals?: Record<string, number>;
+};
+
+type CashInputs = {
+  openingCash: string;
+  cashPaidOut: string;
+  actualCash: string;
+};
+
+type CurrencySalesSummary = {
+  currencyCode: CurrencyCode;
+  paymentTotals: Record<string, number>;
+  totalSales: number;
+  cashReceived: number;
+  nonCashReceived: number;
+  transactionCount: number;
 };
 
 function readStorage<T>(key: string): T[] {
@@ -54,12 +91,11 @@ function getLocalDateKey(date: Date) {
   return `${year}-${month}-${day}`;
 }
 
-function formatMoney(amount: number) {
-  return new Intl.NumberFormat("en-UG", {
-    style: "currency",
-    currency: "UGX",
-    maximumFractionDigits: 0,
-  }).format(Number.isFinite(amount) ? amount : 0);
+function formatMoney(amount: number, currencyCode: CurrencyCode) {
+  return formatCurrency(
+    Number.isFinite(amount) ? amount : 0,
+    currencyCode
+  );
 }
 
 function formatDate(date: string) {
@@ -68,6 +104,42 @@ function formatDate(date: string) {
     month: "long",
     year: "numeric",
   });
+}
+
+function getDefaultInputs(): CashInputs {
+  return {
+    openingCash: "0",
+    cashPaidOut: "0",
+    actualCash: "",
+  };
+}
+
+function getClosingSummaries(
+  closing: ClosingRecord
+): CurrencyClosingSummary[] {
+  if (
+    Array.isArray(closing.currencySummaries) &&
+    closing.currencySummaries.length > 0
+  ) {
+    return closing.currencySummaries;
+  }
+
+  // Old closing records did not store a currency code.
+  // Their amounts are treated as UGX without changing the saved data.
+  return [
+    {
+      currencyCode: "UGX",
+      openingCash: Number(closing.openingCash) || 0,
+      cashReceived: Number(closing.cashReceived) || 0,
+      cashPaidOut: Number(closing.cashPaidOut) || 0,
+      expectedCash: Number(closing.expectedCash) || 0,
+      actualCash: Number(closing.actualCash) || 0,
+      difference: Number(closing.difference) || 0,
+      totalSales: Number(closing.totalSales) || 0,
+      transactionCount: Number(closing.transactionCount) || 0,
+      paymentTotals: closing.paymentTotals || {},
+    },
+  ];
 }
 
 export default function DailyClosing() {
@@ -83,9 +155,10 @@ export default function DailyClosing() {
     getLocalDateKey(new Date())
   );
 
-  const [openingCash, setOpeningCash] = useState("0");
-  const [cashPaidOut, setCashPaidOut] = useState("0");
-  const [actualCash, setActualCash] = useState("");
+  const [cashInputs, setCashInputs] = useState<
+    Record<string, CashInputs>
+  >({});
+
   const [notice, setNotice] = useState("");
 
   useEffect(() => {
@@ -114,63 +187,59 @@ export default function DailyClosing() {
     });
   }, [sales, selectedDate]);
 
-  const summary = useMemo(() => {
-    const paymentTotals = dailySales.reduce<Record<string, number>>(
-      (totals, sale) => {
-        const method = sale.paymentMethod || "Other";
-        totals[method] =
-          (totals[method] || 0) + (Number(sale.salePrice) || 0);
+  const currencySummaries = useMemo(() => {
+    const grouped = new Map<string, CurrencySalesSummary>();
 
-        return totals;
-      },
-      {}
+    dailySales.forEach((sale) => {
+      const currencyCode = getRecordCurrency(sale.currencyCode);
+
+      if (!grouped.has(currencyCode)) {
+        grouped.set(currencyCode, {
+          currencyCode,
+          paymentTotals: {},
+          totalSales: 0,
+          cashReceived: 0,
+          nonCashReceived: 0,
+          transactionCount: 0,
+        });
+      }
+
+      const summary = grouped.get(currencyCode)!;
+      const amount = Number(sale.salePrice) || 0;
+      const method = sale.paymentMethod || "Other";
+
+      summary.paymentTotals[method] =
+        (summary.paymentTotals[method] || 0) + amount;
+
+      summary.totalSales += amount;
+      summary.transactionCount += 1;
+
+      if (method === "Cash") {
+        summary.cashReceived += amount;
+      } else {
+        summary.nonCashReceived += amount;
+      }
+    });
+
+    // Include the shop's operating currency even if there were no sales
+    // in that currency, so the shop can still reconcile its cash drawer.
+    const shopCurrency = getShopCurrency();
+
+    if (!grouped.has(shopCurrency)) {
+      grouped.set(shopCurrency, {
+        currencyCode: shopCurrency,
+        paymentTotals: {},
+        totalSales: 0,
+        cashReceived: 0,
+        nonCashReceived: 0,
+        transactionCount: 0,
+      });
+    }
+
+    return Array.from(grouped.values()).sort((a, b) =>
+      a.currencyCode.localeCompare(b.currencyCode)
     );
-
-    const totalSales = dailySales.reduce(
-      (total, sale) => total + (Number(sale.salePrice) || 0),
-      0
-    );
-
-    const cashReceived = paymentTotals["Cash"] || 0;
-
-    const nonCashReceived = Object.entries(paymentTotals)
-      .filter(([method]) => method !== "Cash")
-      .reduce((total, [, amount]) => total + amount, 0);
-
-    return {
-      paymentTotals,
-      totalSales,
-      cashReceived,
-      nonCashReceived,
-      transactionCount: dailySales.length,
-    };
   }, [dailySales]);
-
-  const opening = Number(openingCash);
-  const paidOut = Number(cashPaidOut);
-  const counted = Number(actualCash);
-
-  const validOpening =
-    openingCash.trim() !== "" &&
-    Number.isFinite(opening) &&
-    opening >= 0;
-
-  const validPaidOut =
-    cashPaidOut.trim() !== "" &&
-    Number.isFinite(paidOut) &&
-    paidOut >= 0;
-
-  const expectedCash =
-    (validOpening ? opening : 0) +
-    summary.cashReceived -
-    (validPaidOut ? paidOut : 0);
-
-  const validActual =
-    actualCash.trim() !== "" &&
-    Number.isFinite(counted) &&
-    counted >= 0;
-
-  const difference = validActual ? counted - expectedCash : 0;
 
   const existingClosing = closings.find(
     (closing) => closing.date === selectedDate
@@ -180,56 +249,166 @@ export default function DailyClosing() {
     b.date.localeCompare(a.date)
   );
 
+  const updateCashInput = (
+    currencyCode: CurrencyCode,
+    field: keyof CashInputs,
+    value: string
+  ) => {
+    setCashInputs((previous) => ({
+      ...previous,
+      [currencyCode]: {
+        ...getDefaultInputs(),
+        ...previous[currencyCode],
+        [field]: value,
+      },
+    }));
+  };
+
+  const getInputs = (currencyCode: CurrencyCode) => ({
+    ...getDefaultInputs(),
+    ...cashInputs[currencyCode],
+  });
+
+  const getReconciliation = (
+    summary: CurrencySalesSummary
+  ) => {
+    const inputs = getInputs(summary.currencyCode);
+
+    const opening = Number(inputs.openingCash);
+    const paidOut = Number(inputs.cashPaidOut);
+    const counted = Number(inputs.actualCash);
+
+    const validOpening =
+      inputs.openingCash.trim() !== "" &&
+      Number.isFinite(opening) &&
+      opening >= 0;
+
+    const validPaidOut =
+      inputs.cashPaidOut.trim() !== "" &&
+      Number.isFinite(paidOut) &&
+      paidOut >= 0;
+
+    const validActual =
+      inputs.actualCash.trim() !== "" &&
+      Number.isFinite(counted) &&
+      counted >= 0;
+
+    const expectedCash =
+      (validOpening ? opening : 0) +
+      summary.cashReceived -
+      (validPaidOut ? paidOut : 0);
+
+    const difference = validActual
+      ? counted - expectedCash
+      : 0;
+
+    return {
+      inputs,
+      opening,
+      paidOut,
+      counted,
+      validOpening,
+      validPaidOut,
+      validActual,
+      expectedCash,
+      difference,
+    };
+  };
+
   const saveClosing = () => {
     setNotice("");
 
-    if (!validOpening || !validPaidOut) {
-      setNotice("Enter valid, non-negative opening cash and cash paid out.");
+    const reconciliations = currencySummaries.map((summary) => ({
+      summary,
+      reconciliation: getReconciliation(summary),
+    }));
+
+    const invalidOpening = reconciliations.some(
+      ({ reconciliation }) => !reconciliation.validOpening
+    );
+
+    const invalidPaidOut = reconciliations.some(
+      ({ reconciliation }) => !reconciliation.validPaidOut
+    );
+
+    const invalidActual = reconciliations.some(
+      ({ reconciliation }) => !reconciliation.validActual
+    );
+
+    const negativeExpected = reconciliations.some(
+      ({ reconciliation }) => reconciliation.expectedCash < 0
+    );
+
+    if (invalidOpening || invalidPaidOut) {
+      setNotice(
+        "Enter valid, non-negative opening cash and cash paid out for every currency."
+      );
       return;
     }
 
-    if (!validActual) {
-      setNotice("Enter the actual cash counted before saving.");
+    if (invalidActual) {
+      setNotice(
+        "Enter the actual cash counted for every currency before saving."
+      );
       return;
     }
 
-    if (expectedCash < 0) {
-      setNotice("Expected cash cannot be negative. Check your entries.");
+    if (negativeExpected) {
+      setNotice(
+        "Expected cash cannot be negative. Check your entries."
+      );
       return;
     }
 
-    const latestClosings = readStorage<ClosingRecord>(CLOSINGS_KEY);
+    const latestClosings =
+      readStorage<ClosingRecord>(CLOSINGS_KEY);
 
-    if (latestClosings.some((closing) => closing.date === selectedDate)) {
+    if (
+      latestClosings.some(
+        (closing) => closing.date === selectedDate
+      )
+    ) {
       setClosings(latestClosings);
       setNotice("A closing already exists for this date.");
       return;
     }
 
+    const savedSummaries: CurrencyClosingSummary[] =
+      reconciliations.map(({ summary, reconciliation }) => ({
+        currencyCode: summary.currencyCode,
+        openingCash: reconciliation.opening,
+        cashReceived: summary.cashReceived,
+        cashPaidOut: reconciliation.paidOut,
+        expectedCash: reconciliation.expectedCash,
+        actualCash: reconciliation.counted,
+        difference: reconciliation.difference,
+        totalSales: summary.totalSales,
+        transactionCount: summary.transactionCount,
+        paymentTotals: summary.paymentTotals,
+      }));
+
     const record: ClosingRecord = {
       id: `CLOSE-${selectedDate}`,
       date: selectedDate,
-      openingCash: opening,
-      cashReceived: summary.cashReceived,
-      cashPaidOut: paidOut,
-      expectedCash,
-      actualCash: counted,
-      difference,
-      totalSales: summary.totalSales,
-      transactionCount: summary.transactionCount,
-      paymentTotals: summary.paymentTotals,
+      currencySummaries: savedSummaries,
       closedAt: new Date().toISOString(),
     };
 
     try {
       const updated = [...latestClosings, record];
 
-      localStorage.setItem(CLOSINGS_KEY, JSON.stringify(updated));
+      localStorage.setItem(
+        CLOSINGS_KEY,
+        JSON.stringify(updated)
+      );
+
       setClosings(updated);
       setNotice("Daily closing saved successfully.");
-      setActualCash("");
+      setCashInputs({});
     } catch {
-      setNotice("Unable to save closing. Check available browser storage.");
+      setNotice(
+        "Unable to save closing. Check available browser storage."
+      );
     }
   };
 
@@ -243,7 +422,8 @@ export default function DailyClosing() {
         <div>
           <h1>Daily closing</h1>
           <p className="page-subtitle">
-            Reconcile daily sales, payment methods and physical cash.
+            Reconcile daily sales, payment methods and physical cash
+            separately for each currency.
           </p>
         </div>
 
@@ -278,77 +458,92 @@ export default function DailyClosing() {
             <strong>This date has already been closed.</strong>
             <span>
               Saved on{" "}
-              {new Date(existingClosing.closedAt).toLocaleString("en-UG")}.
-              A second closing cannot be created for this date.
+              {new Date(existingClosing.closedAt).toLocaleString(
+                "en-UG"
+              )}
+              . A second closing cannot be created for this date.
             </span>
           </div>
         </div>
       )}
 
-      <div className="daily-closing-metrics">
-        <article className="surface-card operations-stat">
-          <div className="operations-report-icon">
-            <Banknote size={19} />
-          </div>
-          <span>Total sales</span>
-          <strong>{formatMoney(summary.totalSales)}</strong>
-          <small>{summary.transactionCount} transactions</small>
-        </article>
-
-        <article className="surface-card operations-stat">
-          <div className="operations-report-icon">
-            <Wallet size={19} />
-          </div>
-          <span>Cash received</span>
-          <strong>{formatMoney(summary.cashReceived)}</strong>
-          <small>Physical cash payments only</small>
-        </article>
-
-        <article className="surface-card operations-stat">
-          <div className="operations-report-icon">
-            <Banknote size={19} />
-          </div>
-          <span>Non-cash payments</span>
-          <strong>{formatMoney(summary.nonCashReceived)}</strong>
-          <small>Mobile money and bank transfers</small>
-        </article>
-      </div>
-
       <div className="daily-closing-grid">
         <section className="surface-card daily-closing-card">
           <div className="inventory-card-heading">
             <div>
-              <div className="card-kicker">PAYMENT BREAKDOWN</div>
-              <h2>Today's collections</h2>
+              <div className="card-kicker">DAILY COLLECTIONS</div>
+              <h2>Sales by currency</h2>
             </div>
             <Wallet size={19} />
           </div>
 
-          {Object.keys(summary.paymentTotals).length === 0 ? (
-            <div className="inventory-empty">
-              <Banknote size={24} />
-              <strong>No sales recorded</strong>
-              <span>Sales for the selected date will appear here.</span>
-            </div>
-          ) : (
-            <div className="operations-report-payments">
-              {Object.entries(summary.paymentTotals).map(
-                ([method, amount]) => (
-                  <div className="operations-report-payment" key={method}>
-                    <span>{method}</span>
-                    <strong>{formatMoney(amount)}</strong>
+          {currencySummaries.map((summary) => (
+            <div
+              className="daily-closing-currency-section"
+              key={summary.currencyCode}
+            >
+              <div className="operations-report-divider" />
+
+              <div className="daily-closing-total">
+                <strong>{summary.currencyCode}</strong>
+                <strong>
+                  {formatMoney(
+                    summary.totalSales,
+                    summary.currencyCode
+                  )}
+                </strong>
+              </div>
+
+              <div className="operations-report-payments">
+                {Object.keys(summary.paymentTotals).length === 0 ? (
+                  <div className="operations-report-payment">
+                    <span>No sales recorded</span>
+                    <strong>
+                      {formatMoney(0, summary.currencyCode)}
+                    </strong>
                   </div>
-                )
-              )}
+                ) : (
+                  Object.entries(summary.paymentTotals).map(
+                    ([method, amount]) => (
+                      <div
+                        className="operations-report-payment"
+                        key={method}
+                      >
+                        <span>{method}</span>
+                        <strong>
+                          {formatMoney(amount, summary.currencyCode)}
+                        </strong>
+                      </div>
+                    )
+                  )
+                )}
+              </div>
+
+              <div className="operations-report-payment">
+                <span>Cash received</span>
+                <strong>
+                  {formatMoney(
+                    summary.cashReceived,
+                    summary.currencyCode
+                  )}
+                </strong>
+              </div>
+
+              <div className="operations-report-payment">
+                <span>Non-cash received</span>
+                <strong>
+                  {formatMoney(
+                    summary.nonCashReceived,
+                    summary.currencyCode
+                  )}
+                </strong>
+              </div>
+
+              <small>
+                {summary.transactionCount} transactions
+              </small>
             </div>
-          )}
-
-          <div className="operations-report-divider" />
-
-          <div className="daily-closing-total">
-            <span>Total collected</span>
-            <strong>{formatMoney(summary.totalSales)}</strong>
-          </div>
+          ))}
         </section>
 
         <section className="surface-card daily-closing-card">
@@ -360,90 +555,153 @@ export default function DailyClosing() {
             <ClipboardCheck size={19} />
           </div>
 
-          <div className="daily-closing-fields">
-            <label className="inventory-field">
-              <span>Opening cash (UGX)</span>
-              <input
-                type="number"
-                min="0"
-                value={openingCash}
-                disabled={Boolean(existingClosing)}
-                onChange={(event) => setOpeningCash(event.target.value)}
-                placeholder="e.g. 100000"
-              />
-            </label>
+          {currencySummaries.map((summary) => {
+            const reconciliation = getReconciliation(summary);
+            const {
+              inputs,
+              validActual,
+              expectedCash,
+              difference,
+            } = reconciliation;
 
-            <label className="inventory-field">
-              <span>Cash paid out (UGX)</span>
-              <input
-                type="number"
-                min="0"
-                value={cashPaidOut}
-                disabled={Boolean(existingClosing)}
-                onChange={(event) => setCashPaidOut(event.target.value)}
-                placeholder="e.g. 20000"
-              />
-            </label>
-
-            <div className="daily-closing-calculation">
-              <span>Expected cash in drawer</span>
-              <strong>{formatMoney(expectedCash)}</strong>
-              <small>
-                Opening cash + cash received − cash paid out
-              </small>
-            </div>
-
-            <label className="inventory-field">
-              <span>Actual cash counted (UGX)</span>
-              <input
-                type="number"
-                min="0"
-                value={actualCash}
-                disabled={Boolean(existingClosing)}
-                onChange={(event) => setActualCash(event.target.value)}
-                placeholder="Enter physical cash count"
-              />
-            </label>
-
-            {validActual && (
+            return (
               <div
-                className={`daily-closing-difference ${
-                  difference < 0
-                    ? "is-short"
-                    : difference > 0
-                      ? "is-over"
-                      : "is-balanced"
-                }`}
+                className="daily-closing-currency-section"
+                key={summary.currencyCode}
               >
-                <span>
-                  {difference < 0
-                    ? "Cash shortage"
-                    : difference > 0
-                      ? "Cash surplus"
-                      : "Cash balanced"}
-                </span>
-                <strong>
-                  {difference > 0 ? "+" : ""}
-                  {formatMoney(difference)}
-                </strong>
+                <div className="operations-report-divider" />
+
+                <div className="daily-closing-total">
+                  <strong>{summary.currencyCode}</strong>
+                  <span>
+                    {summary.transactionCount} transactions
+                  </span>
+                </div>
+
+                <div className="daily-closing-fields">
+                  <label className="inventory-field">
+                    <span>
+                      Opening cash ({summary.currencyCode})
+                    </span>
+                    <input
+                      type="number"
+                      min="0"
+                      step="any"
+                      value={inputs.openingCash}
+                      disabled={Boolean(existingClosing)}
+                      onChange={(event) =>
+                        updateCashInput(
+                          summary.currencyCode,
+                          "openingCash",
+                          event.target.value
+                        )
+                      }
+                      placeholder="Enter opening cash"
+                    />
+                  </label>
+
+                  <label className="inventory-field">
+                    <span>
+                      Cash paid out ({summary.currencyCode})
+                    </span>
+                    <input
+                      type="number"
+                      min="0"
+                      step="any"
+                      value={inputs.cashPaidOut}
+                      disabled={Boolean(existingClosing)}
+                      onChange={(event) =>
+                        updateCashInput(
+                          summary.currencyCode,
+                          "cashPaidOut",
+                          event.target.value
+                        )
+                      }
+                      placeholder="Enter cash paid out"
+                    />
+                  </label>
+
+                  <div className="daily-closing-calculation">
+                    <span>Expected cash in drawer</span>
+                    <strong>
+                      {formatMoney(
+                        expectedCash,
+                        summary.currencyCode
+                      )}
+                    </strong>
+                    <small>
+                      Opening cash + cash received − cash paid out
+                    </small>
+                  </div>
+
+                  <label className="inventory-field">
+                    <span>
+                      Actual cash counted ({summary.currencyCode})
+                    </span>
+                    <input
+                      type="number"
+                      min="0"
+                      step="any"
+                      value={inputs.actualCash}
+                      disabled={Boolean(existingClosing)}
+                      onChange={(event) =>
+                        updateCashInput(
+                          summary.currencyCode,
+                          "actualCash",
+                          event.target.value
+                        )
+                      }
+                      placeholder="Enter physical cash count"
+                    />
+                  </label>
+
+                  {validActual && (
+                    <div
+                      className={`daily-closing-difference ${
+                        difference < 0
+                          ? "is-short"
+                          : difference > 0
+                            ? "is-over"
+                            : "is-balanced"
+                      }`}
+                    >
+                      <span>
+                        {difference < 0
+                          ? "Cash shortage"
+                          : difference > 0
+                            ? "Cash surplus"
+                            : "Cash balanced"}
+                      </span>
+                      <strong>
+                        {difference > 0 ? "+" : ""}
+                        {formatMoney(
+                          difference,
+                          summary.currencyCode
+                        )}
+                      </strong>
+                    </div>
+                  )}
+                </div>
               </div>
-            )}
+            );
+          })}
 
-            {notice && (
-              <p className="operations-notice" role="status">
-                <CheckCircle2 size={15} /> {notice}
-              </p>
-            )}
+          {notice && (
+            <p className="operations-notice" role="status">
+              <CheckCircle2 size={15} /> {notice}
+            </p>
+          )}
 
-            <button
-              className="button button-primary"
-              onClick={saveClosing}
-              disabled={Boolean(existingClosing)}
-            >
-              <CheckCircle2 size={16} />
-              {existingClosing ? "Already closed" : "Save daily closing"}
-            </button>
-          </div>
+          <button
+            className="button button-primary"
+            onClick={saveClosing}
+            disabled={Boolean(existingClosing)}
+          >
+            <CheckCircle2 size={16} />
+            {existingClosing
+              ? "Already closed"
+              : "Save daily closing"}
+          </button>
         </section>
       </div>
 
@@ -452,32 +710,81 @@ export default function DailyClosing() {
           <div className="card-kicker">SAVED RECONCILIATION</div>
           <h2>Closing summary</h2>
 
-          <div className="operations-report-payments">
-            <div className="operations-report-payment">
-              <span>Opening cash</span>
-              <strong>{formatMoney(existingClosing.openingCash)}</strong>
+          {getClosingSummaries(existingClosing).map((summary) => (
+            <div
+              className="daily-closing-currency-section"
+              key={summary.currencyCode}
+            >
+              <div className="operations-report-divider" />
+
+              <div className="daily-closing-total">
+                <strong>{summary.currencyCode}</strong>
+                <strong>
+                  {formatMoney(
+                    summary.totalSales,
+                    summary.currencyCode
+                  )}
+                </strong>
+              </div>
+
+              <div className="operations-report-payments">
+                <div className="operations-report-payment">
+                  <span>Opening cash</span>
+                  <strong>
+                    {formatMoney(
+                      summary.openingCash,
+                      summary.currencyCode
+                    )}
+                  </strong>
+                </div>
+                <div className="operations-report-payment">
+                  <span>Cash received</span>
+                  <strong>
+                    {formatMoney(
+                      summary.cashReceived,
+                      summary.currencyCode
+                    )}
+                  </strong>
+                </div>
+                <div className="operations-report-payment">
+                  <span>Cash paid out</span>
+                  <strong>
+                    {formatMoney(
+                      summary.cashPaidOut,
+                      summary.currencyCode
+                    )}
+                  </strong>
+                </div>
+                <div className="operations-report-payment">
+                  <span>Expected cash</span>
+                  <strong>
+                    {formatMoney(
+                      summary.expectedCash,
+                      summary.currencyCode
+                    )}
+                  </strong>
+                </div>
+                <div className="operations-report-payment">
+                  <span>Actual cash counted</span>
+                  <strong>
+                    {formatMoney(
+                      summary.actualCash,
+                      summary.currencyCode
+                    )}
+                  </strong>
+                </div>
+                <div className="operations-report-payment">
+                  <span>Difference</span>
+                  <strong>
+                    {formatMoney(
+                      summary.difference,
+                      summary.currencyCode
+                    )}
+                  </strong>
+                </div>
+              </div>
             </div>
-            <div className="operations-report-payment">
-              <span>Cash received</span>
-              <strong>{formatMoney(existingClosing.cashReceived)}</strong>
-            </div>
-            <div className="operations-report-payment">
-              <span>Cash paid out</span>
-              <strong>{formatMoney(existingClosing.cashPaidOut)}</strong>
-            </div>
-            <div className="operations-report-payment">
-              <span>Expected cash</span>
-              <strong>{formatMoney(existingClosing.expectedCash)}</strong>
-            </div>
-            <div className="operations-report-payment">
-              <span>Actual cash counted</span>
-              <strong>{formatMoney(existingClosing.actualCash)}</strong>
-            </div>
-            <div className="operations-report-payment">
-              <span>Difference</span>
-              <strong>{formatMoney(existingClosing.difference)}</strong>
-            </div>
-          </div>
+          ))}
         </section>
       )}
 
@@ -496,37 +803,67 @@ export default function DailyClosing() {
           <div className="inventory-empty">
             <History size={24} />
             <strong>No closing records yet</strong>
-            <span>Your saved daily reconciliations will appear here.</span>
+            <span>
+              Your saved daily reconciliations will appear here.
+            </span>
           </div>
         ) : (
           <div className="operations-record-list">
-            {sortedClosings.map((closing) => (
-              <article className="operations-record" key={closing.id}>
-                <div className="operations-record-icon">
-                  <ClipboardCheck size={17} />
-                </div>
+            {sortedClosings.map((closing) => {
+              const summaries = getClosingSummaries(closing);
 
-                <div className="operations-record-copy">
-                  <strong>{formatDate(closing.date)}</strong>
-                  <span>
-                    {closing.transactionCount} transactions · Expected{" "}
-                    {formatMoney(closing.expectedCash)}
-                  </span>
-                  <span>
-                    Actual counted: {formatMoney(closing.actualCash)}
-                  </span>
-                </div>
-
-                <strong
-                  className={`operations-amount ${
-                    closing.difference < 0 ? "report-negative" : ""
-                  }`}
+              return (
+                <article
+                  className="operations-record"
+                  key={closing.id}
                 >
-                  {closing.difference > 0 ? "+" : ""}
-                  {formatMoney(closing.difference)}
-                </strong>
-              </article>
-            ))}
+                  <div className="operations-record-icon">
+                    <ClipboardCheck size={17} />
+                  </div>
+
+                  <div className="operations-record-copy">
+                    <strong>{formatDate(closing.date)}</strong>
+
+                    {summaries.map((summary) => (
+                      <span key={summary.currencyCode}>
+                        {summary.currencyCode}:{" "}
+                        {summary.transactionCount} transactions ·
+                        Expected{" "}
+                        {formatMoney(
+                          summary.expectedCash,
+                          summary.currencyCode
+                        )}
+                        {" · "}Actual{" "}
+                        {formatMoney(
+                          summary.actualCash,
+                          summary.currencyCode
+                        )}
+                      </span>
+                    ))}
+                  </div>
+
+                  <div className="operations-record-copy">
+                    {summaries.map((summary) => (
+                      <strong
+                        className={`operations-amount ${
+                          summary.difference < 0
+                            ? "report-negative"
+                            : ""
+                        }`}
+                        key={summary.currencyCode}
+                      >
+                        {summary.currencyCode}:{" "}
+                        {summary.difference > 0 ? "+" : ""}
+                        {formatMoney(
+                          summary.difference,
+                          summary.currencyCode
+                        )}
+                      </strong>
+                    ))}
+                  </div>
+                </article>
+              );
+            })}
           </div>
         )}
       </section>
@@ -534,10 +871,11 @@ export default function DailyClosing() {
       <div className="operations-note">
         <CheckCircle2 size={16} />
         <span>
-          Daily closings are saved in this browser's local storage. Cash
-          paid out is entered manually. Mobile money and bank transfers are
-          excluded from physical cash reconciliation. These records are not
-          yet cloud-synchronised.
+          Daily closings are saved in this browser's local storage.
+          Each currency is reconciled independently. Cash paid out is
+          entered manually. Mobile money and bank transfers are
+          excluded from physical cash reconciliation. These records
+          are not yet cloud-synchronised.
         </span>
       </div>
     </section>
