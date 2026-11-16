@@ -1,5 +1,11 @@
 
-import { useEffect, useMemo, useState } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   CalendarClock,
   CheckCircle2,
@@ -82,6 +88,57 @@ function isAccessory(item: DeviceRecord) {
   return item.category === "Accessory / spare part";
 }
 
+function formatPriceInput(value: string): string {
+  const cleaned = value.replace(/,/g, "").replace(/[^\d.]/g, "");
+  const decimalPosition = cleaned.indexOf(".");
+
+  const integerPart =
+    decimalPosition === -1
+      ? cleaned
+      : cleaned.slice(0, decimalPosition);
+
+  const decimalPart =
+    decimalPosition === -1
+      ? ""
+      : cleaned.slice(decimalPosition + 1).replace(/\./g, "");
+
+  const groupedInteger = integerPart.replace(
+    /\B(?=(\d{3})+(?!\d))/g,
+    ","
+  );
+
+  return decimalPosition === -1
+    ? groupedInteger
+    : `${groupedInteger}.${decimalPart}`;
+}
+
+function parsePriceInput(value: string): number {
+  return Number(value.replace(/,/g, ""));
+}
+
+function getCaretPosition(
+  formattedValue: string,
+  digitCount: number
+): number {
+  if (digitCount <= 0) {
+    return 0;
+  }
+
+  let counted = 0;
+
+  for (let index = 0; index < formattedValue.length; index++) {
+    if (formattedValue[index] !== ",") {
+      counted++;
+    }
+
+    if (counted === digitCount) {
+      return index + 1;
+    }
+  }
+
+  return formattedValue.length;
+}
+
 export default function Sales() {
   const [devices, setDevices] = useState<DeviceRecord[]>(readInventory);
   const [sales, setSales] = useState<SaleRecord[]>(readSales);
@@ -98,15 +155,48 @@ export default function Sales() {
   );
   const [notice, setNotice] = useState("");
 
+  const priceInputRef = useRef<HTMLInputElement>(null);
+  const pendingPriceCaret = useRef<number | null>(null);
+
+  useLayoutEffect(() => {
+    if (
+      pendingPriceCaret.current !== null &&
+      priceInputRef.current
+    ) {
+      const position = getCaretPosition(
+        salePrice,
+        pendingPriceCaret.current
+      );
+
+      priceInputRef.current.setSelectionRange(position, position);
+      pendingPriceCaret.current = null;
+    }
+  }, [salePrice]);
+
   const availableItems = useMemo(
     () => devices.filter((item) => item.status === "In shop"),
     [devices]
   );
 
-  const filteredItems = availableItems.filter((item) =>
-    `${item.brand} ${item.model} ${item.identifier}`
-      .toLowerCase()
-      .includes(search.toLowerCase())
+  const normalizedSearch = search.trim().toLowerCase();
+
+  const filteredItems = useMemo(
+    () =>
+      availableItems.filter((item) => {
+        const searchableValues = [
+          item.brand,
+          item.model,
+          item.identifier,
+          ...(item.secondaryIdentifiers ?? []),
+        ];
+
+        return searchableValues.some((value) =>
+          String(value ?? "")
+            .toLowerCase()
+            .includes(normalizedSearch)
+        );
+      }),
+    [availableItems, normalizedSearch]
   );
 
   const selectedItem = availableItems.find(
@@ -131,7 +221,7 @@ export default function Sales() {
     : 1;
 
   const totalPrice =
-    (Number(salePrice) || 0) * requestedQuantity;
+    parsePriceInput(salePrice) * requestedQuantity;
 
   useEffect(() => {
     try {
@@ -143,130 +233,159 @@ export default function Sales() {
 
   const handleCurrencyChange = (newCurrency: string) => {
     setSaleCurrencyCode(newCurrency);
-    // Clear the amount so it cannot accidentally be interpreted
-    // as a different currency after changing the selection.
     setSalePrice("");
+    setNotice("");
+  };
+
+  const handlePriceChange = (
+    event: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    const inputValue = event.target.value;
+    const cursorPosition =
+      event.target.selectionStart ?? inputValue.length;
+
+    const charactersBeforeCursor = inputValue
+      .slice(0, cursorPosition)
+      .replace(/,/g, "")
+      .replace(/[^\d.]/g, "").length;
+
+    const formattedValue = formatPriceInput(inputValue);
+
+    pendingPriceCaret.current = charactersBeforeCursor;
+    setSalePrice(formattedValue);
+  };
+
+  const handleItemSelection = (item: DeviceRecord) => {
+    setSelectedId(item.id);
+
+    const itemCurrency = getRecordCurrency(item.currencyCode);
+
+    setSalePrice(
+      itemCurrency === saleCurrencyCode
+        ? formatPriceInput(item.sellingPrice ?? "")
+        : ""
+    );
+
+    setQuantity("1");
+    setSearch("");
     setNotice("");
   };
 
   const handleSale = () => {
     setNotice("");
 
-    if (!selectedItem) {
-      setNotice("Select an available item before recording a sale.");
+    if (!selectedId) {
+      setNotice("Please select an item to sell.");
       return;
     }
 
-    const unitPrice = Number(salePrice);
+    const price = parsePriceInput(salePrice);
+    const quantityToSell = Number(quantity);
 
-    if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
-      setNotice("Enter a valid selling price greater than zero.");
+    if (!Number.isFinite(price) || price <= 0) {
+      setNotice("Enter a valid selling price.");
       return;
     }
-
-    const saleQuantity = isAccessory(selectedItem)
-      ? Number(quantity)
-      : 1;
 
     if (
-      !Number.isInteger(saleQuantity) ||
-      saleQuantity <= 0
+      !Number.isInteger(quantityToSell) ||
+      quantityToSell <= 0
     ) {
       setNotice("Enter a valid whole-number quantity.");
       return;
     }
 
-    if (
-      !transactionDate ||
-      Number.isNaN(new Date(transactionDate).getTime())
-    ) {
-      setNotice("Enter a valid transaction date and time.");
+    if (!transactionDate) {
+      setNotice("Please select a transaction date.");
       return;
     }
 
-    if (!CURRENCY_OPTIONS.some(
-      (currency) => currency.code === saleCurrencyCode
-    )) {
-      setNotice("Select a valid sale currency.");
+    if (!saleCurrencyCode) {
+      setNotice("Please select a sale currency.");
       return;
     }
 
-    // Re-read the latest inventory before completing the sale.
     const latestDevices = readInventory();
+
     const latestItem = latestDevices.find(
-      (item) => item.id === selectedItem.id
+      (item) => item.id === selectedId
     );
 
     if (!latestItem || latestItem.status !== "In shop") {
-      setDevices(latestDevices);
-      setSelectedId("");
       setNotice(
-        "This item is no longer available. Refresh your selection."
+        "This item is no longer available in the shop. Refresh and try again."
       );
       return;
     }
 
     const accessory = isAccessory(latestItem);
-    const currentQuantity = accessory
+    const latestAvailableQuantity = accessory
       ? Math.max(0, Number(latestItem.quantity) || 0)
       : 1;
 
-    if (saleQuantity > currentQuantity) {
-      setDevices(latestDevices);
+    if (accessory && quantityToSell > latestAvailableQuantity) {
       setNotice(
-        `Insufficient stock. Only ${currentQuantity} unit(s) are available.`
+        `Only ${latestAvailableQuantity} units are currently available.`
       );
       return;
     }
 
-    const unitCost = Number(latestItem.costPrice) || 0;
-    const saleTotal = unitPrice * saleQuantity;
-    const costTotal = unitCost * saleQuantity;
+    if (!accessory && quantityToSell !== 1) {
+      setNotice("Devices can only be sold one at a time.");
+      return;
+    }
 
-    // The sale currency is selected independently from the
-    // original purchase currency.
-    const costCurrencyCode = getRecordCurrency(
-      latestItem.currencyCode
-    );
+    const unitCost = Number(latestItem.costPrice) || 0;
+    const saleTotal = price * quantityToSell;
+    const costTotal = unitCost * quantityToSell;
 
     const sale: SaleRecord = {
-      id: `SALE-${Date.now()}`,
+      id: crypto.randomUUID(),
       deviceId: latestItem.id,
       deviceName: `${latestItem.brand} ${latestItem.model}`,
       identifier: latestItem.identifier,
       salePrice: saleTotal,
       paymentMethod,
-      transactionDate: new Date(transactionDate).toISOString(),
+      transactionDate,
       costPrice: costTotal,
-      category: accessory ? "Accessory / spare part" : "Device",
-      quantitySold: saleQuantity,
-      unitPrice,
+      category: latestItem.category,
+      quantitySold: accessory ? quantityToSell : 1,
+      unitPrice: price,
       currencyCode: saleCurrencyCode,
-      costCurrencyCode,
+      costCurrencyCode: getRecordCurrency(latestItem.currencyCode),
     };
 
     const updatedDevices = latestDevices.map((item) => {
-      if (item.id !== latestItem.id) return item;
+      if (item.id !== selectedId) {
+        return item;
+      }
 
       if (accessory) {
-        const remainingQuantity = currentQuantity - saleQuantity;
+        const remainingQuantity =
+          Math.max(0, Number(item.quantity) || 0) - quantityToSell;
 
         return {
           ...item,
           quantity: remainingQuantity,
-          status: remainingQuantity === 0
-            ? "Sold" as const
-            : "In shop" as const,
-          updated: "Just now",
+          status:
+            remainingQuantity === 0
+              ? "Sold" as const
+              : "In shop" as const,
+          updated: new Date().toISOString(),
         };
       }
 
       return {
         ...item,
         status: "Sold" as const,
-        updated: "Just now",
+        updated: new Date().toISOString(),
       };
     });
+
+    const previousInventoryRaw =
+      localStorage.getItem(INVENTORY_KEY);
+    const previousSalesRaw =
+      localStorage.getItem(SALES_KEY);
 
     const updatedSales = [sale, ...readSales()];
 
@@ -275,6 +394,7 @@ export default function Sales() {
         INVENTORY_KEY,
         JSON.stringify(updatedDevices)
       );
+
       localStorage.setItem(
         SALES_KEY,
         JSON.stringify(updatedSales)
@@ -282,22 +402,46 @@ export default function Sales() {
 
       setDevices(updatedDevices);
       setSales(updatedSales);
+
       setSelectedId("");
       setSalePrice("");
       setQuantity("1");
-      setPaymentMethod("Cash");
-      setSaleCurrencyCode(getShopCurrency());
-      setTransactionDate(new Date().toISOString().slice(0, 16));
+      setNotice("Sale recorded successfully.");
+    } catch (error) {
+      console.error("Could not save sale:", error);
+
+      let rollbackSucceeded = true;
+
+      try {
+        if (previousInventoryRaw === null) {
+          localStorage.removeItem(INVENTORY_KEY);
+        } else {
+          localStorage.setItem(
+            INVENTORY_KEY,
+            previousInventoryRaw
+          );
+        }
+
+        if (previousSalesRaw === null) {
+          localStorage.removeItem(SALES_KEY);
+        } else {
+          localStorage.setItem(
+            SALES_KEY,
+            previousSalesRaw
+          );
+        }
+      } catch (rollbackError) {
+        rollbackSucceeded = false;
+        console.error(
+          "Could not roll back failed sale:",
+          rollbackError
+        );
+      }
 
       setNotice(
-        accessory
-          ? `Sale recorded. ${saleQuantity} unit(s) sold successfully.`
-          : "Sale recorded successfully. Inventory status updated to Sold."
-      );
-    } catch (error) {
-      console.error("Could not complete sale:", error);
-      setNotice(
-        "Could not save the sale. Check browser storage and try again."
+        rollbackSucceeded
+          ? "Could not save the sale. No changes were kept. Check browser storage and try again."
+          : "The sale could not be saved and automatic rollback also failed. Check inventory and sales records before trying again."
       );
     }
   };
@@ -326,64 +470,156 @@ export default function Sales() {
           <h2>Record a sale</h2>
 
           <div className="operations-form">
-            <label className="inventory-field">
-              <span>Find available item</span>
-              <div className="inventory-list-search">
-                <Search size={16} />
-                <input
-                  value={search}
-                  onChange={(event) => setSearch(event.target.value)}
-                  placeholder="Search phone, accessory or identifier"
-                />
+            <div className="inventory-field">
+              <label htmlFor="sales-stock-search">
+                <span>Find available item</span>
+              </label>
+
+              <div style={{ position: "relative" }}>
+                <div className="inventory-list-search">
+                  <Search size={16} />
+                  <input
+                    id="sales-stock-search"
+                    value={search}
+                    onChange={(event) => {
+                      setSearch(event.target.value);
+                      setSelectedId("");
+                      setSalePrice("");
+                      setQuantity("1");
+                      setNotice("");
+                    }}
+                    placeholder="Start typing a name, model or identifier..."
+                    autoComplete="off"
+                  />
+                </div>
+
+                {normalizedSearch.length > 0 && (
+                  <div
+                    role="listbox"
+                    aria-label="Matching available stock"
+                    style={{
+                      position: "absolute",
+                      top: "calc(100% + 6px)",
+                      left: 0,
+                      right: 0,
+                      zIndex: 50,
+                      maxHeight: "280px",
+                      overflowY: "auto",
+                      background: "var(--card-bg, #ffffff)",
+                      color: "var(--text-primary, #171717)",
+                      border: "1px solid var(--border-color, #d8dce3)",
+                      borderRadius: "12px",
+                      boxShadow: "0 12px 30px rgba(0, 0, 0, 0.16)",
+                      padding: "6px",
+                    }}
+                  >
+                    {filteredItems.length > 0 ? (
+                      filteredItems.map((item) => (
+                        <button
+                          key={item.id}
+                          type="button"
+                          role="option"
+                          aria-selected={selectedId === item.id}
+                          onClick={() => handleItemSelection(item)}
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: "12px",
+                            width: "100%",
+                            padding: "11px 10px",
+                            border: "none",
+                            borderRadius: "8px",
+                            background:
+                              selectedId === item.id
+                                ? "var(--hover-bg, #edf2f8)"
+                                : "transparent",
+                            color: "inherit",
+                            textAlign: "left",
+                            cursor: "pointer",
+                          }}
+                        >
+                          <span
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                              width: "34px",
+                              height: "34px",
+                              flexShrink: 0,
+                              borderRadius: "9px",
+                              background: "var(--hover-bg, #edf2f8)",
+                            }}
+                          >
+                            {isAccessory(item) ? (
+                              <Package size={17} />
+                            ) : (
+                              <Smartphone size={17} />
+                            )}
+                          </span>
+
+                          <span
+                            style={{
+                              display: "flex",
+                              flexDirection: "column",
+                              gap: "3px",
+                              minWidth: 0,
+                              flex: 1,
+                            }}
+                          >
+                            <strong style={{ fontSize: "13px" }}>
+                              {item.brand} {item.model}
+                            </strong>
+                            <span
+                              style={{
+                                fontSize: "12px",
+                                opacity: 0.7,
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                              }}
+                            >
+                              {item.identifier}
+                            </span>
+                          </span>
+
+                          <span
+                            style={{
+                              fontSize: "11px",
+                              opacity: 0.75,
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            {isAccessory(item)
+                              ? `${item.quantity ?? 0} available`
+                              : "Device"}
+                          </span>
+                        </button>
+                      ))
+                    ) : (
+                      <div
+                        style={{
+                          padding: "16px 12px",
+                          fontSize: "13px",
+                          opacity: 0.7,
+                          textAlign: "center",
+                        }}
+                      >
+                        No matching available stock found.
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
-            </label>
 
-            <label className="inventory-field">
-              <span>Select item</span>
-              <select
-                value={selectedId}
-                onChange={(event) => {
-                  const id = event.target.value;
-                  setSelectedId(id);
-
-                  const item = availableItems.find(
-                    (record) => record.id === id
-                  );
-
-                  const itemCurrency = item
-                    ? getRecordCurrency(item.currencyCode)
-                    : null;
-
-                  // Only reuse the saved selling price when its
-                  // currency matches the selected sale currency.
-                  setSalePrice(
-                    item && itemCurrency === saleCurrencyCode
-                      ? item.sellingPrice ?? ""
-                      : ""
-                  );
-
-                  setQuantity("1");
-                  setNotice("");
-                }}
-              >
-                <option value="">Choose an item</option>
-                {filteredItems.map((item) => (
-                  <option key={item.id} value={item.id}>
-                    {isAccessory(item) ? "[Accessory]" : "[Device]"}{" "}
-                    {item.brand} {item.model} — {item.identifier}
-                    {isAccessory(item)
-                      ? ` (${item.quantity ?? 0} available)`
-                      : ""}
-                  </option>
-                ))}
-              </select>
+              <small className="field-hint">
+                Type any part of the brand, model, SKU or identifier to see matching stock.
+              </small>
 
               {availableItems.length === 0 && (
                 <small className="field-hint">
                   No available items. Receive stock into Inventory first.
                 </small>
               )}
-            </label>
+            </div>
 
             {selectedItem && (
               <div className="inventory-info-banner surface-card">
@@ -455,12 +691,13 @@ export default function Sales() {
                   : `Selling price (${saleCurrencyCode})`}
               </span>
               <input
-                type="number"
-                min="0"
-                step="any"
+                ref={priceInputRef}
+                type="text"
+                inputMode="decimal"
                 value={salePrice}
-                onChange={(event) => setSalePrice(event.target.value)}
+                onChange={handlePriceChange}
                 placeholder="Enter actual sale price"
+                autoComplete="off"
               />
             </label>
 
