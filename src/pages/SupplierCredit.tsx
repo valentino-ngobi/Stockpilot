@@ -1,5 +1,6 @@
 
 import { useEffect, useMemo, useState } from "react";
+import type { ChangeEvent } from "react";
 import {
   ArrowDownLeft,
   ArrowUpRight,
@@ -52,6 +53,73 @@ type ConvertedTotal = {
 };
 
 const STORAGE_KEY = "stockpilot-credit-records";
+
+// Format numbers with thousands separators while preserving decimals.
+function formatAmountInput(value: string): string {
+  const cleaned = value.replace(/,/g, "").replace(/[^\d.]/g, "");
+  const decimalIndex = cleaned.indexOf(".");
+
+  const integerPart =
+    decimalIndex === -1 ? cleaned : cleaned.slice(0, decimalIndex);
+
+  const decimalPart =
+    decimalIndex === -1 ? "" : cleaned.slice(decimalIndex + 1).replace(/\./g, "");
+
+  const formattedInteger = integerPart.replace(
+    /\B(?=(\d{3})+(?!\d))/g,
+    ","
+  );
+
+  return decimalIndex === -1
+    ? formattedInteger
+    : `${formattedInteger}.${decimalPart}`;
+}
+
+// Remove display commas before converting the value into a number.
+function parseAmountInput(value: string): number {
+  return Number(value.replace(/,/g, ""));
+}
+
+// Update the displayed value while keeping the cursor in the correct position.
+function handleFormattedAmountChange(
+  event: ChangeEvent<HTMLInputElement>,
+  setter: (value: string) => void
+) {
+  const input = event.currentTarget;
+  const rawValue = input.value;
+  const originalCaret = input.selectionStart ?? rawValue.length;
+
+  const charactersBeforeCaret = rawValue
+    .slice(0, originalCaret)
+    .replace(/[^\d]/g, "").length;
+
+  const formattedValue = formatAmountInput(rawValue);
+
+  setter(formattedValue);
+
+  requestAnimationFrame(() => {
+    let position = 0;
+    let charactersFound = 0;
+
+    while (
+      position < formattedValue.length &&
+      charactersFound < charactersBeforeCaret
+    ) {
+      if (/\d/.test(formattedValue[position])) {
+        charactersFound++;
+      }
+
+      position++;
+    }
+
+    // Keep the cursor after a comma when the separator is at this position.
+    while (formattedValue[position] === ",") {
+      position++;
+    }
+
+    input.setSelectionRange(position, position);
+  });
+}
 
 function readRecords(): CreditRecord[] {
   try {
@@ -196,7 +264,6 @@ export default function SupplierCredit() {
   const [paymentAmount, setPaymentAmount] = useState("");
   const [paymentDate, setPaymentDate] = useState(getToday());
 
-  // Keep the ledger in sync with purchases and other browser tabs.
   useEffect(() => {
     const refresh = () => setRecords(readRecords());
 
@@ -209,7 +276,6 @@ export default function SupplierCredit() {
     };
   }, []);
 
-  // Automatically request fresh exchange rates whenever this page opens.
   useEffect(() => {
     let cancelled = false;
 
@@ -304,7 +370,7 @@ export default function SupplierCredit() {
   }, [records, activeTab]);
 
   const addRecord = () => {
-    const parsedAmount = Number(amount);
+    const parsedAmount = parseAmountInput(amount);
 
     if (!party.trim()) {
       setNotice("Enter the supplier or customer name.");
@@ -344,7 +410,7 @@ export default function SupplierCredit() {
   };
 
   const addPayment = (record: CreditRecord) => {
-    const parsedAmount = Number(paymentAmount);
+    const parsedAmount = parseAmountInput(paymentAmount);
     const balance = getBalance(record);
     const recordCurrency = getCurrency(record);
 
@@ -559,11 +625,12 @@ export default function SupplierCredit() {
               <label className="inventory-field">
                 <span>Original amount ({currencyCode}) *</span>
                 <input
-                  type="number"
-                  min="0"
-                  step="any"
+                  type="text"
+                  inputMode="decimal"
                   value={amount}
-                  onChange={(event) => setAmount(event.target.value)}
+                  onChange={(event) =>
+                    handleFormattedAmountChange(event, setAmount)
+                  }
                   placeholder="Enter amount"
                 />
               </label>
@@ -722,13 +789,14 @@ export default function SupplierCredit() {
                           <label className="inventory-field">
                             <span>Payment amount ({recordCurrency})</span>
                             <input
-                              type="number"
-                              min="0"
-                              max={balance}
-                              step="any"
+                              type="text"
+                              inputMode="decimal"
                               value={paymentAmount}
                               onChange={(event) =>
-                                setPaymentAmount(event.target.value)
+                                handleFormattedAmountChange(
+                                  event,
+                                  setPaymentAmount
+                                )
                               }
                               placeholder={`Up to ${balance}`}
                             />
