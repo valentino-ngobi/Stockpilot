@@ -1,5 +1,19 @@
 
 import { useMemo, useState, useEffect } from "react";
+import MetricCard from "../components/MetricCard";
+import {
+  convertToSnapshotCurrency,
+  formatCurrency,
+  getRecordCurrency,
+  getSavedExchangeRateSnapshot,
+  getShopCurrency,
+  refreshExchangeRateSnapshot,
+} from "../utils/currency";
+
+import type {
+  CurrencyCode,
+  ExchangeRateSnapshot,
+} from "../utils/currency";
 import {
   ArrowRight,
   ArrowUpRight,
@@ -17,8 +31,6 @@ import {
   ShoppingCart,
 } from "lucide-react";
 import type { PageKey } from "../components/Sidebar";
-import MetricCard from "../components/MetricCard";
-
 interface OverviewProps {
   onNavigate: (page: PageKey) => void;
 }
@@ -33,6 +45,7 @@ type InventoryRecord = {
   storage?: string;
   costPrice?: string;
   sellingPrice?: string;
+  currencyCode?: CurrencyCode;
   category?: "Device" | "Accessory / spare part";
   quantity?: number;
   updated: string;
@@ -47,6 +60,8 @@ type SaleRecord = {
   paymentMethod: string;
   transactionDate: string;
   costPrice: number;
+  currencyCode?: CurrencyCode;
+  costCurrencyCode?: CurrencyCode;
 };
 
 const INVENTORY_KEY = "stockpilot-inventory";
@@ -72,12 +87,31 @@ function readSales(): SaleRecord[] {
   }
 }
 
-function formatUGX(amount: number): string {
-  return new Intl.NumberFormat("en-UG", {
-    style: "currency",
-    currency: "UGX",
-    maximumFractionDigits: 0,
-  }).format(amount);
+function formatMoney(
+  amount: number,
+  currencyCode: CurrencyCode = getShopCurrency()
+): string {
+  return formatCurrency(amount, currencyCode);
+}
+function convertOverviewAmount(
+  amount: number,
+  sourceCurrency: CurrencyCode,
+  snapshot: ExchangeRateSnapshot | null,
+  targetCurrency: CurrencyCode
+): number | null {
+  if (sourceCurrency === targetCurrency) {
+    return amount;
+  }
+
+  if (!snapshot) {
+    return null;
+  }
+
+  return convertToSnapshotCurrency(
+    amount,
+    sourceCurrency,
+    snapshot
+  );
 }
 
 function localDateKey(date: Date): string {
@@ -111,6 +145,15 @@ export default function Overview({ onNavigate }: OverviewProps) {
   const [sales, setSales] = useState<SaleRecord[]>(readSales);
   const [now, setNow] = useState(new Date());
 
+  const [shopCurrency] = useState<CurrencyCode>(() =>
+    getShopCurrency()
+  );
+
+  const [rateSnapshot, setRateSnapshot] =
+    useState<ExchangeRateSnapshot | null>(() =>
+      getSavedExchangeRateSnapshot(getShopCurrency())
+    );
+
   useEffect(() => {
     const refreshData = () => {
       setInventory(readInventory());
@@ -127,9 +170,38 @@ export default function Overview({ onNavigate }: OverviewProps) {
     };
   }, []);
 
+  useEffect(() => {
+    let active = true;
+
+    const savedSnapshot =
+      getSavedExchangeRateSnapshot(shopCurrency);
+
+    if (savedSnapshot) {
+      setRateSnapshot(savedSnapshot);
+    }
+
+    refreshExchangeRateSnapshot(shopCurrency)
+      .then((snapshot) => {
+        if (active) {
+          setRateSnapshot(snapshot);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setRateSnapshot(
+            getSavedExchangeRateSnapshot(shopCurrency)
+          );
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [shopCurrency]);
+
   const todayKey = localDateKey(now);
 
-  const stock = useMemo(() => {
+   const stock = useMemo(() => {
     const active = inventory.filter((item) => item.status !== "Sold");
 
     const units = (item: InventoryRecord) =>
@@ -137,51 +209,101 @@ export default function Overview({ onNavigate }: OverviewProps) {
         ? Math.max(0, Number(item.quantity) || 0)
         : 1;
 
-    const stockValue = active.reduce(
-      (total, item) =>
-        total + (Number(item.costPrice) || 0) * units(item),
-      0
-    );
+    let stockValue = 0;
+    let unconvertedValuation = 0;
+
+    active.forEach((item) => {
+      const cost = (Number(item.costPrice) || 0) * units(item);
+      const sourceCurrency = getRecordCurrency(item.currencyCode);
+
+            const converted = convertOverviewAmount(
+        cost,
+        sourceCurrency,
+        rateSnapshot,
+        shopCurrency
+      );
+
+      if (converted === null) {
+        if (cost !== 0 && sourceCurrency !== shopCurrency) {
+          unconvertedValuation += 1;
+        }
+      } else {
+        stockValue += converted;
+      }
+    });
 
     return {
       totalUnits: active.reduce((total, item) => total + units(item), 0),
+
       totalDevices: active.filter(
         (item) => item.category !== "Accessory / spare part"
       ).length,
+
       accessoryUnits: active
         .filter((item) => item.category === "Accessory / spare part")
         .reduce((total, item) => total + units(item), 0),
+
       inShop: active
         .filter((item) => item.status === "In shop")
         .reduce((total, item) => total + units(item), 0),
+
       withMiddleman: active
         .filter((item) => item.status === "With middle-man")
         .reduce((total, item) => total + units(item), 0),
+
       atRepairer: active
         .filter((item) => item.status === "At repairer")
         .reduce((total, item) => total + units(item), 0),
-      stockValue,
-    };
-  }, [inventory]);
 
-  const todaySales = useMemo(
+      stockValue,
+      unconvertedValuation,
+    };
+  }, [inventory, rateSnapshot, shopCurrency]);
+
+    const todaySales = useMemo(
     () =>
       sales.filter((sale) => {
         const date = new Date(sale.transactionDate);
-        return !Number.isNaN(date.getTime()) &&
-          localDateKey(date) === todayKey;
+
+        return (
+          !Number.isNaN(date.getTime()) &&
+          localDateKey(date) === todayKey
+        );
       }),
     [sales, todayKey]
   );
 
-  const todayRevenue = todaySales.reduce(
-    (total, sale) => total + (Number(sale.salePrice) || 0),
-    0
+  const todayRevenue = useMemo(
+    () =>
+      todaySales.reduce((total, sale) => {
+                const converted = convertOverviewAmount(
+          Number(sale.salePrice) || 0,
+          getRecordCurrency(sale.currencyCode),
+          rateSnapshot,
+          shopCurrency
+        );
+
+        return total + (converted ?? 0);
+      }, 0),
+    [todaySales, rateSnapshot]
   );
 
-  const cashReceived = todaySales
-    .filter((sale) => sale.paymentMethod === "Cash")
-    .reduce((total, sale) => total + (Number(sale.salePrice) || 0), 0);
+  const cashReceived = useMemo(
+    () =>
+      todaySales
+        .filter((sale) => sale.paymentMethod === "Cash")
+        .reduce((total, sale) => {
+                    const converted = convertOverviewAmount(
+            Number(sale.salePrice) || 0,
+            getRecordCurrency(sale.currencyCode),
+            rateSnapshot,
+            shopCurrency
+          );
+
+          return total + (converted ?? 0);
+        }, 0),
+    [todaySales, rateSnapshot]
+  );
 
   const followUpCount = stock.withMiddleman + stock.atRepairer;
 
@@ -191,23 +313,35 @@ export default function Overview({ onNavigate }: OverviewProps) {
       date.setDate(now.getDate() - (6 - index));
 
       const key = localDateKey(date);
+
       const total = sales
         .filter((sale) => {
           const saleDate = new Date(sale.transactionDate);
-          return !Number.isNaN(saleDate.getTime()) &&
-            localDateKey(saleDate) === key;
+
+          return (
+            !Number.isNaN(saleDate.getTime()) &&
+            localDateKey(saleDate) === key
+          );
         })
-        .reduce(
-          (sum, sale) => sum + (Number(sale.salePrice) || 0),
-          0
-        );
+        .reduce((sum, sale) => {
+                    const converted = convertOverviewAmount(
+            Number(sale.salePrice) || 0,
+            getRecordCurrency(sale.currencyCode),
+            rateSnapshot,
+            shopCurrency
+          );
+
+          return sum + (converted ?? 0);
+        }, 0);
 
       return {
-        label: date.toLocaleDateString("en-UG", { weekday: "short" }),
+        label: date.toLocaleDateString("en-UG", {
+          weekday: "short",
+        }),
         total,
       };
     });
-  }, [sales, now]);
+  }, [sales, now, rateSnapshot]);
 
   const weeklyRevenue = lastSevenDays.reduce(
     (total, day) => total + day.total,
@@ -226,11 +360,24 @@ export default function Overview({ onNavigate }: OverviewProps) {
     return sales
       .filter((sale) => {
         const date = new Date(sale.transactionDate);
-        return !Number.isNaN(date.getTime()) &&
-          date >= start && date < new Date(end.getTime() + 86400000);
+
+        return (
+          !Number.isNaN(date.getTime()) &&
+          date >= start &&
+          date < new Date(end.getTime() + 86400000)
+        );
       })
-      .reduce((total, sale) => total + (Number(sale.salePrice) || 0), 0);
-  }, [sales, now]);
+      .reduce((total, sale) => {
+                const converted = convertOverviewAmount(
+          Number(sale.salePrice) || 0,
+          getRecordCurrency(sale.currencyCode),
+          rateSnapshot,
+          shopCurrency
+        );
+
+        return total + (converted ?? 0);
+      }, 0);
+  }, [sales, now, rateSnapshot]);
 
   const weeklyChange =
     previousSevenDaysRevenue > 0
@@ -241,8 +388,7 @@ export default function Overview({ onNavigate }: OverviewProps) {
   const maxChartValue = Math.max(
     ...lastSevenDays.map((day) => day.total),
     1
-  );
-
+    );
   const recentSales = sales.slice(0, 5);
 
   const recentInventory = [...inventory]
@@ -304,28 +450,35 @@ export default function Overview({ onNavigate }: OverviewProps) {
         </div>
       </section>
 
-      <section className="metrics-grid" aria-label="Shop metrics">
+            <section className="metrics-grid" aria-label="Shop metrics">
         <MetricCard
           label="Inventory at cost"
-          value={formatUGX(stock.stockValue)}
-          note="Unsold stock at recorded cost"
+          value={formatMoney(stock.stockValue, shopCurrency)}
+          note={
+            stock.unconvertedValuation > 0
+              ? `${stock.unconvertedValuation} records excluded: exchange rate unavailable`
+              : "Unsold stock at recorded cost"
+          }
           icon={BoxesIcon}
           tone="blue"
         />
+
         <MetricCard
           label="Sales today"
-          value={formatUGX(todayRevenue)}
+          value={formatMoney(todayRevenue, shopCurrency)}
           note={`${todaySales.length} recorded transactions`}
           icon={ReceiptText}
           tone="violet"
         />
+
         <MetricCard
           label="Cash received today"
-          value={formatUGX(cashReceived)}
+          value={formatMoney(cashReceived, shopCurrency)}
           note="Cash payments only"
           icon={Wallet}
           tone="cyan"
         />
+
         <MetricCard
           label="Needs follow-up"
           value={`${followUpCount} items`}
@@ -349,7 +502,9 @@ export default function Overview({ onNavigate }: OverviewProps) {
 
           <div className="sales-summary">
             <div>
-              <div className="sales-total">{formatUGX(weeklyRevenue)}</div>
+              <div className="sales-total">
+                {formatMoney(weeklyRevenue, shopCurrency)}
+              </div>
               <div className="sales-comparison">
                 {weeklyChange === null ? (
                   <span>No previous-week comparison yet</span>
@@ -397,7 +552,7 @@ export default function Overview({ onNavigate }: OverviewProps) {
                 {lastSevenDays.map((day) => (
                   <div
                     key={day.label}
-                    title={`${day.label}: ${formatUGX(day.total)}`}
+                    title={`${day.label}: ${formatMoney(day.total, shopCurrency)}`}
                     style={{
                       flex: 1,
                       maxWidth: "48px",
@@ -493,7 +648,7 @@ export default function Overview({ onNavigate }: OverviewProps) {
       </section>
 
       <section className="bottom-grid">
-        <article className="surface-card activity-card">
+                <article className="surface-card activity-card">
           <div className="card-heading">
             <div>
               <div className="card-kicker">TRANSACTION FEED</div>
@@ -520,6 +675,7 @@ export default function Overview({ onNavigate }: OverviewProps) {
                   <div className="operations-record-icon">
                     <ShoppingCart size={17} />
                   </div>
+
                   <div className="operations-record-copy">
                     <strong>{sale.deviceName}</strong>
                     <span>{sale.identifier}</span>
@@ -527,8 +683,12 @@ export default function Overview({ onNavigate }: OverviewProps) {
                       {new Date(sale.transactionDate).toLocaleString()}
                     </span>
                   </div>
+
                   <strong className="operations-amount">
-                    {formatUGX(Number(sale.salePrice) || 0)}
+                    {formatMoney(
+                      Number(sale.salePrice) || 0,
+                      getRecordCurrency(sale.currencyCode)
+                    )}
                   </strong>
                 </article>
               ))}
@@ -597,7 +757,7 @@ export default function Overview({ onNavigate }: OverviewProps) {
         </article>
       </section>
 
-      <section className="devices-section surface-card">
+            <section className="devices-section surface-card">
         <div className="card-heading">
           <div>
             <div className="card-kicker">INVENTORY RECORDS</div>
@@ -630,6 +790,7 @@ export default function Overview({ onNavigate }: OverviewProps) {
                   <th />
                 </tr>
               </thead>
+
               <tbody>
                 {recentInventory.map((item) => (
                   <tr key={item.id}>
@@ -642,6 +803,7 @@ export default function Overview({ onNavigate }: OverviewProps) {
                             <Smartphone size={18} />
                           )}
                         </div>
+
                         <div>
                           <strong>{item.brand} {item.model}</strong>
                           <span>
@@ -652,16 +814,24 @@ export default function Overview({ onNavigate }: OverviewProps) {
                         </div>
                       </div>
                     </td>
+
                     <td className="identifier-cell">{item.identifier}</td>
+
                     <td>
                       <span className={`status-pill status-${getStatusClass(item.status)}`}>
                         <i />{item.status}
                       </span>
                     </td>
+
                     <td className="price-cell">
-                      {formatUGX(Number(item.sellingPrice) || 0)}
+                      {formatMoney(
+                        Number(item.sellingPrice) || 0,
+                        getRecordCurrency(item.currencyCode)
+                      )}
                     </td>
+
                     <td className="updated-cell">{item.updated}</td>
+
                     <td>
                       <button
                         className="row-more"
