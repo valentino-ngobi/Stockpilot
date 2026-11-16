@@ -24,6 +24,19 @@ import {
   Wrench,
 } from "lucide-react";
 import type { PageKey } from "../components/Sidebar";
+import {
+  convertToSnapshotCurrency,
+  formatCurrency,
+  getRecordCurrency,
+  getSavedExchangeRateSnapshot,
+  getShopCurrency,
+  refreshExchangeRateSnapshot,
+} from "../utils/currency";
+
+import type {
+  CurrencyCode,
+  ExchangeRateSnapshot,
+} from "../utils/currency";
 
 type OperationRecord = {
   id: number;
@@ -42,6 +55,7 @@ type InventoryRecord = {
   category?: "Device" | "Accessory / spare part";
   quantity?: number;
   costPrice?: string;
+  currencyCode?: CurrencyCode;
 };
 
 type PaymentMethod =
@@ -62,6 +76,8 @@ type SaleRecord = {
   category?: "Device" | "Accessory / spare part";
   quantitySold?: number;
   unitPrice?: number;
+  currencyCode?: CurrencyCode;
+  costCurrencyCode?: CurrencyCode;
 };
 
 const INVENTORY_KEY = "stockpilot-inventory";
@@ -79,12 +95,41 @@ function readStorage<T>(key: string): T[] {
   }
 }
 
-function formatMoney(amount: number) {
-  return new Intl.NumberFormat("en-UG", {
-    style: "currency",
-    currency: "UGX",
-    maximumFractionDigits: 0,
-  }).format(Number.isFinite(amount) ? amount : 0);
+function formatMoney(
+  amount: number,
+  currencyCode: CurrencyCode = getShopCurrency()
+) {
+  return formatCurrency(
+    Number.isFinite(amount) ? amount : 0,
+    currencyCode
+  );
+}
+
+function convertReportAmount(
+  amount: number,
+  sourceCurrency: CurrencyCode | undefined,
+  targetCurrency: CurrencyCode,
+  snapshot: ExchangeRateSnapshot | null
+): number | null {
+  const safeAmount = Number(amount);
+
+  if (!Number.isFinite(safeAmount)) return null;
+
+  const sourceCode = getRecordCurrency(sourceCurrency);
+
+  if (sourceCode === targetCurrency) {
+    return safeAmount;
+  }
+
+  if (!snapshot || snapshot.baseCode !== targetCurrency) {
+    return null;
+  }
+
+  return convertToSnapshotCurrency(
+    safeAmount,
+    sourceCode,
+    snapshot
+  );
 }
 
 function getSaleCategory(sale: SaleRecord) {
@@ -117,6 +162,15 @@ function ReportsView() {
 
   const [period, setPeriod] = useState<"7" | "30" | "all">("7");
 
+  const [shopCurrency] = useState<CurrencyCode>(() =>
+    getShopCurrency()
+  );
+
+  const [rateSnapshot, setRateSnapshot] =
+    useState<ExchangeRateSnapshot | null>(() =>
+      getSavedExchangeRateSnapshot(getShopCurrency())
+    );
+
   useEffect(() => {
     const refreshData = () => {
       setInventory(readStorage<InventoryRecord>(INVENTORY_KEY));
@@ -131,6 +185,35 @@ function ReportsView() {
       window.removeEventListener("storage", refreshData);
     };
   }, []);
+
+  useEffect(() => {
+    let active = true;
+
+    const savedSnapshot =
+      getSavedExchangeRateSnapshot(shopCurrency);
+
+    if (savedSnapshot) {
+      setRateSnapshot(savedSnapshot);
+    }
+
+    refreshExchangeRateSnapshot(shopCurrency)
+      .then((snapshot) => {
+        if (active) {
+          setRateSnapshot(snapshot);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setRateSnapshot(
+            getSavedExchangeRateSnapshot(shopCurrency)
+          );
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [shopCurrency]);
 
   const filteredSales = useMemo(() => {
     const now = new Date();
@@ -151,18 +234,18 @@ function ReportsView() {
     });
   }, [sales, period]);
 
+  
   const report = useMemo(() => {
-    const revenue = filteredSales.reduce(
-      (total, sale) => total + (Number(sale.salePrice) || 0),
-      0
-    );
+    let revenue = 0;
+    let costOfGoods = 0;
+    let unconvertedRevenue = 0;
+    let unconvertedCosts = 0;
 
-    const costOfGoods = filteredSales.reduce(
-      (total, sale) => total + (Number(sale.costPrice) || 0),
-      0
-    );
-
-    const grossProfit = revenue - costOfGoods;
+    const paymentTotals: Record<string, number> = {};
+    const categoryTotals = {
+      devices: 0,
+      accessories: 0,
+    };
 
     const deviceSales = filteredSales.filter(
       (sale) => getSaleCategory(sale) === "Device"
@@ -172,34 +255,76 @@ function ReportsView() {
       (sale) => getSaleCategory(sale) === "Accessory / spare part"
     );
 
-    const accessoryUnits = accessorySales.reduce(
-      (total, sale) => total + getSaleQuantity(sale),
-      0
-    );
+    let accessoryUnits = 0;
 
-    const paymentTotals = filteredSales.reduce<Record<string, number>>(
-      (totals, sale) => {
+    filteredSales.forEach((sale) => {
+      const saleAmount = convertReportAmount(
+        sale.salePrice,
+        sale.currencyCode,
+        shopCurrency,
+        rateSnapshot
+      );
+
+      if (saleAmount === null) {
+        unconvertedRevenue += 1;
+      } else {
+        revenue += saleAmount;
+
+        if (getSaleCategory(sale) === "Device") {
+          categoryTotals.devices += saleAmount;
+        } else {
+          categoryTotals.accessories += saleAmount;
+        }
+
         const method = sale.paymentMethod || "Other";
-        totals[method] = (totals[method] || 0) + (Number(sale.salePrice) || 0);
-        return totals;
-      },
-      {}
-    );
+        paymentTotals[method] =
+          (paymentTotals[method] || 0) + saleAmount;
+      }
+
+      const costAmount = convertReportAmount(
+        sale.costPrice,
+        sale.costCurrencyCode ?? sale.currencyCode,
+        shopCurrency,
+        rateSnapshot
+      );
+
+      if (costAmount === null) {
+        unconvertedCosts += 1;
+      } else {
+        costOfGoods += costAmount;
+      }
+
+      if (getSaleCategory(sale) === "Accessory / spare part") {
+        accessoryUnits += getSaleQuantity(sale);
+      }
+    });
+
+    const grossProfit =
+      unconvertedRevenue > 0 || unconvertedCosts > 0
+        ? null
+        : revenue - costOfGoods;
 
     return {
       revenue,
       costOfGoods,
       grossProfit,
+      unconvertedRevenue,
+      unconvertedCosts,
+      categoryTotals,
       transactionCount: filteredSales.length,
       deviceCount: deviceSales.length,
       accessoryCount: accessorySales.length,
       accessoryUnits,
       paymentTotals,
     };
-  }, [filteredSales]);
+  }, [filteredSales, shopCurrency, rateSnapshot]);
 
+
+ 
   const stock = useMemo(() => {
-    const available = inventory.filter((item) => item.status !== "Sold");
+    const available = inventory.filter(
+      (item) => item.status !== "Sold"
+    );
 
     const devices = available.filter(
       (item) => item.category !== "Accessory / spare part"
@@ -210,29 +335,44 @@ function ReportsView() {
     );
 
     const accessoryUnits = accessories.reduce(
-      (total, item) => total + Math.max(0, Number(item.quantity) || 0),
-      0
-    );
-
-    const deviceValue = devices.reduce(
-      (total, item) => total + (Number(item.costPrice) || 0),
-      0
-    );
-
-    const accessoryValue = accessories.reduce(
       (total, item) =>
-        total +
-        (Number(item.costPrice) || 0) *
-          Math.max(0, Number(item.quantity) || 0),
+        total + Math.max(0, Number(item.quantity) || 0),
       0
     );
+
+    let valuation = 0;
+    let unconvertedValuation = 0;
+
+    available.forEach((item) => {
+      const quantity =
+        item.category === "Accessory / spare part"
+          ? Math.max(0, Number(item.quantity) || 0)
+          : 1;
+
+      const originalCost =
+        (Number(item.costPrice) || 0) * quantity;
+
+      const convertedCost = convertReportAmount(
+        originalCost,
+        item.currencyCode,
+        shopCurrency,
+        rateSnapshot
+      );
+
+      if (convertedCost === null) {
+        unconvertedValuation += 1;
+      } else {
+        valuation += convertedCost;
+      }
+    });
 
     return {
       deviceCount: devices.length,
       accessoryTypes: accessories.length,
       accessoryUnits,
       totalUnits: devices.length + accessoryUnits,
-      valuation: deviceValue + accessoryValue,
+      valuation,
+      unconvertedValuation,
       withMiddleMan: available.filter(
         (item) => item.status === "With middle-man"
       ).length,
@@ -240,39 +380,58 @@ function ReportsView() {
         (item) => item.status === "At repairer"
       ).length,
     };
-  }, [inventory]);
+  }, [inventory, shopCurrency, rateSnapshot]);
 
-  const dailySales = useMemo(() => {
-    const days = period === "30" ? 30 : 7;
-    const now = new Date();
 
-    return Array.from({ length: days }, (_, index) => {
-      const date = new Date(now);
-      date.setHours(0, 0, 0, 0);
-      date.setDate(date.getDate() - (days - index - 1));
+ const dailySales = useMemo(() => {
+  const days = period === "30" ? 30 : 7;
+  const now = new Date();
 
-      const key = getLocalDateKey(date);
+  return Array.from({ length: days }, (_, index) => {
+    const date = new Date(now);
+    date.setHours(0, 0, 0, 0);
+    date.setDate(date.getDate() - (days - index - 1));
 
-      const total = filteredSales
-        .filter((sale) => {
-          const saleDate = new Date(sale.transactionDate);
-          return (
-            !Number.isNaN(saleDate.getTime()) &&
-            getLocalDateKey(saleDate) === key
-          );
-        })
-        .reduce((sum, sale) => sum + (Number(sale.salePrice) || 0), 0);
+    const key = getLocalDateKey(date);
 
-      return {
-        key,
-        label: date.toLocaleDateString("en-UG", {
-          day: "numeric",
-          month: "short",
-        }),
-        total,
-      };
+    const daySales = filteredSales.filter((sale) => {
+      const saleDate = new Date(sale.transactionDate);
+
+      return (
+        !Number.isNaN(saleDate.getTime()) &&
+        getLocalDateKey(saleDate) === key
+      );
     });
-  }, [filteredSales, period]);
+
+    let total = 0;
+    let unconvertedCount = 0;
+
+    daySales.forEach((sale) => {
+      const convertedAmount = convertReportAmount(
+        sale.salePrice,
+        sale.currencyCode,
+        shopCurrency,
+        rateSnapshot
+      );
+
+      if (convertedAmount === null) {
+        unconvertedCount += 1;
+      } else {
+        total += convertedAmount;
+      }
+    });
+
+    return {
+      key,
+      label: date.toLocaleDateString("en-UG", {
+        day: "numeric",
+        month: "short",
+      }),
+      total,
+      unconvertedCount,
+    };
+  });
+}, [filteredSales, period, shopCurrency, rateSnapshot]);
 
   const highestDailySale = Math.max(
     ...dailySales.map((day) => day.total),
@@ -347,7 +506,7 @@ function ReportsView() {
             <Banknote size={19} />
           </div>
           <span>Sales revenue</span>
-          <strong>{formatMoney(report.revenue)}</strong>
+          <strong>{formatMoney(report.revenue, shopCurrency)}</strong>
           <small>{report.transactionCount} transactions</small>
         </article>
 
@@ -356,8 +515,14 @@ function ReportsView() {
             <TrendingUp size={19} />
           </div>
           <span>Estimated gross profit</span>
-          <strong className={report.grossProfit < 0 ? "report-negative" : ""}>
-            {formatMoney(report.grossProfit)}
+          <strong className={
+            report.grossProfit !== null && report.grossProfit < 0
+              ? "report-negative"
+              : ""
+           }>
+            {report.grossProfit === null
+            ? "Unavailable"
+            : formatMoney(report.grossProfit, shopCurrency)}
           </strong>
           <small>Revenue minus recorded cost</small>
         </article>
@@ -367,7 +532,7 @@ function ReportsView() {
             <Wallet size={19} />
           </div>
           <span>Cost of goods sold</span>
-          <strong>{formatMoney(report.costOfGoods)}</strong>
+          <strong>{formatMoney(report.costOfGoods, shopCurrency)}</strong>
           <small>Cost attached to recorded sales</small>
         </article>
 
@@ -376,7 +541,7 @@ function ReportsView() {
             <Package size={19} />
           </div>
           <span>Current stock value</span>
-          <strong>{formatMoney(stock.valuation)}</strong>
+          <strong>{formatMoney(stock.valuation, shopCurrency)}</strong>
           <small>{stock.totalUnits} units still in stock</small>
         </article>
       </div>
@@ -410,7 +575,7 @@ function ReportsView() {
                       }}
                     />
                   </div>
-                  <strong>{formatMoney(day.total)}</strong>
+                  <strong>{formatMoney(day.total, shopCurrency)}</strong>
                 </div>
               ))}
             </div>
@@ -418,70 +583,67 @@ function ReportsView() {
         </section>
 
         <section className="surface-card operations-report-card">
-          <div className="inventory-card-heading">
-            <div>
-              <div className="card-kicker">PRODUCT PERFORMANCE</div>
-              <h2>Sales by category</h2>
-            </div>
-            <ShoppingCart size={19} />
-          </div>
+  <div className="inventory-card-heading">
+    <div>
+      <div className="card-kicker">PRODUCT PERFORMANCE</div>
+      <h2>Sales by category</h2>
+    </div>
+    <ShoppingCart size={19} />
+  </div>
 
-          <div className="operations-report-breakdown">
-            <div className="operations-report-breakdown-row">
-              <div className="operations-report-breakdown-icon">
-                <Smartphone size={18} />
-              </div>
-              <div>
-                <strong>Phones & devices</strong>
-                <span>{report.deviceCount} transactions</span>
-              </div>
-              <strong>{formatMoney(
-                filteredSales
-                  .filter((sale) => getSaleCategory(sale) === "Device")
-                  .reduce((sum, sale) => sum + (Number(sale.salePrice) || 0), 0)
-              )}</strong>
-            </div>
+  <div className="operations-report-breakdown">
+    <div className="operations-report-breakdown-row">
+      <div className="operations-report-breakdown-icon">
+        <Smartphone size={18} />
+      </div>
 
-            <div className="operations-report-breakdown-row">
-              <div className="operations-report-breakdown-icon">
-                <Package size={18} />
-              </div>
-              <div>
-                <strong>Accessories & parts</strong>
-                <span>
-                  {report.accessoryCount} transactions · {report.accessoryUnits} units
-                </span>
-              </div>
-              <strong>{formatMoney(
-                filteredSales
-                  .filter(
-                    (sale) =>
-                      getSaleCategory(sale) === "Accessory / spare part"
-                  )
-                  .reduce((sum, sale) => sum + (Number(sale.salePrice) || 0), 0)
-              )}</strong>
-            </div>
-          </div>
+      <div>
+        <strong>Phones & devices</strong>
+        <span>{report.deviceCount} transactions</span>
+      </div>
 
-          <div className="operations-report-divider" />
+      <strong>
+        {formatMoney(report.categoryTotals.devices, shopCurrency)}
+      </strong>
+    </div>
 
-          <div className="card-kicker">PAYMENT METHODS</div>
+    <div className="operations-report-breakdown-row">
+      <div className="operations-report-breakdown-icon">
+        <Package size={18} />
+      </div>
 
-          {Object.keys(report.paymentTotals).length === 0 ? (
-            <p className="operations-report-empty">
-              No payment records for this period.
-            </p>
-          ) : (
-            <div className="operations-report-payments">
-              {Object.entries(report.paymentTotals).map(([method, total]) => (
-                <div className="operations-report-payment" key={method}>
-                  <span>{method}</span>
-                  <strong>{formatMoney(total)}</strong>
-                </div>
-              ))}
-            </div>
-          )}
-        </section>
+      <div>
+        <strong>Accessories & parts</strong>
+        <span>
+          {report.accessoryCount} transactions · {report.accessoryUnits} units
+        </span>
+      </div>
+
+      <strong>
+        {formatMoney(report.categoryTotals.accessories, shopCurrency)}
+      </strong>
+    </div>
+  </div>
+
+  <div className="operations-report-divider" />
+
+  <div className="card-kicker">PAYMENT METHODS</div>
+
+  {Object.keys(report.paymentTotals).length === 0 ? (
+    <p className="operations-report-empty">
+      No payment records for this period.
+    </p>
+  ) : (
+    <div className="operations-report-payments">
+      {Object.entries(report.paymentTotals).map(([method, total]) => (
+        <div className="operations-report-payment" key={method}>
+          <span>{method}</span>
+          <strong>{formatMoney(total, shopCurrency)}</strong>
+        </div>
+      ))}
+    </div>
+  )}
+</section>
       </div>
 
       <section className="surface-card operations-report-card">
@@ -532,59 +694,65 @@ function ReportsView() {
       </section>
 
       <section className="surface-card operations-report-card">
-        <div className="inventory-card-heading">
-          <div>
-            <div className="card-kicker">TRANSACTION HISTORY</div>
-            <h2>Recent sales</h2>
-          </div>
-          <span className="inventory-count">
-            {filteredSales.length} transactions
-          </span>
-        </div>
+  <div className="inventory-card-heading">
+    <div>
+      <div className="card-kicker">TRANSACTION HISTORY</div>
+      <h2>Recent sales</h2>
+    </div>
 
-        {recentSales.length === 0 ? (
-          <div className="inventory-empty">
-            <Receipt size={25} />
-            <strong>No transactions to display</strong>
-            <span>Record a sale to start building your reports.</span>
-          </div>
-        ) : (
-          <div className="operations-record-list">
-            {recentSales.map((sale) => {
-              const accessory =
-                getSaleCategory(sale) === "Accessory / spare part";
+    <span className="inventory-count">
+      {filteredSales.length} transactions
+    </span>
+  </div>
 
-              return (
-                <article className="operations-record" key={sale.id}>
-                  <div className="operations-record-icon">
-                    {accessory ? (
-                      <Package size={17} />
-                    ) : (
-                      <Smartphone size={17} />
-                    )}
-                  </div>
+  {recentSales.length === 0 ? (
+    <div className="inventory-empty">
+      <Receipt size={25} />
+      <strong>No transactions to display</strong>
+      <span>Record a sale to start building your reports.</span>
+    </div>
+  ) : (
+    <div className="operations-record-list">
+      {recentSales.map((sale) => {
+        const accessory =
+          getSaleCategory(sale) === "Accessory / spare part";
 
-                  <div className="operations-record-copy">
-                    <strong>{sale.deviceName || "Unnamed item"}</strong>
-                    <span>
-                      {accessory
-                        ? `${getSaleQuantity(sale)} units`
-                        : sale.identifier || "Device sale"}
-                      {" · "}
-                      {new Date(sale.transactionDate).toLocaleString("en-UG")}
-                    </span>
-                    <span>{sale.paymentMethod}</span>
-                  </div>
+        return (
+          <article className="operations-record" key={sale.id}>
+            <div className="operations-record-icon">
+              {accessory ? (
+                <Package size={17} />
+              ) : (
+                <Smartphone size={17} />
+              )}
+            </div>
 
-                  <strong className="operations-amount">
-                    {formatMoney(Number(sale.salePrice) || 0)}
-                  </strong>
-                </article>
-              );
-            })}
-          </div>
-        )}
-      </section>
+            <div className="operations-record-copy">
+              <strong>{sale.deviceName || "Unnamed item"}</strong>
+
+              <span>
+                {accessory
+                  ? `${getSaleQuantity(sale)} units`
+                  : sale.identifier || "Device sale"}
+                {" · "}
+                {new Date(sale.transactionDate).toLocaleString("en-UG")}
+              </span>
+
+              <span>{sale.paymentMethod}</span>
+            </div>
+
+            <strong className="operations-amount">
+              {formatMoney(
+                Number(sale.salePrice) || 0,
+                getRecordCurrency(sale.currencyCode)
+              )}
+            </strong>
+          </article>
+        );
+      })}
+    </div>
+  )}
+</section>
 
       <div className="operations-note">
         <ShieldCheck size={16} />
