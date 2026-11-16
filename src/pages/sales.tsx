@@ -11,6 +11,7 @@ import {
   XCircle,
 } from "lucide-react";
 import {
+  CURRENCY_OPTIONS,
   formatCurrency,
   getRecordCurrency,
   getShopCurrency,
@@ -53,6 +54,7 @@ type SaleRecord = {
   quantitySold?: number;
   unitPrice?: number;
   currencyCode?: CurrencyCode;
+  costCurrencyCode?: CurrencyCode;
 };
 
 const INVENTORY_KEY = "stockpilot-inventory";
@@ -86,6 +88,8 @@ export default function Sales() {
   const [search, setSearch] = useState("");
   const [selectedId, setSelectedId] = useState("");
   const [salePrice, setSalePrice] = useState("");
+  const [saleCurrencyCode, setSaleCurrencyCode] =
+    useState<CurrencyCode>(getShopCurrency);
   const [quantity, setQuantity] = useState("1");
   const [paymentMethod, setPaymentMethod] =
     useState<PaymentMethod>("Cash");
@@ -113,9 +117,9 @@ export default function Sales() {
     ? isAccessory(selectedItem)
     : false;
 
-  const saleCurrency = selectedItem
+  const purchaseCurrency = selectedItem
     ? getRecordCurrency(selectedItem.currencyCode)
-    : getShopCurrency();
+    : null;
 
   const availableQuantity =
     selectedItem && selectedIsAccessory
@@ -136,6 +140,14 @@ export default function Sales() {
       console.error("Could not save sales:", error);
     }
   }, [sales]);
+
+  const handleCurrencyChange = (newCurrency: string) => {
+    setSaleCurrencyCode(newCurrency);
+    // Clear the amount so it cannot accidentally be interpreted
+    // as a different currency after changing the selection.
+    setSalePrice("");
+    setNotice("");
+  };
 
   const handleSale = () => {
     setNotice("");
@@ -172,6 +184,13 @@ export default function Sales() {
       return;
     }
 
+    if (!CURRENCY_OPTIONS.some(
+      (currency) => currency.code === saleCurrencyCode
+    )) {
+      setNotice("Select a valid sale currency.");
+      return;
+    }
+
     // Re-read the latest inventory before completing the sale.
     const latestDevices = readInventory();
     const latestItem = latestDevices.find(
@@ -203,7 +222,12 @@ export default function Sales() {
     const unitCost = Number(latestItem.costPrice) || 0;
     const saleTotal = unitPrice * saleQuantity;
     const costTotal = unitCost * saleQuantity;
-    const currencyCode = getRecordCurrency(latestItem.currencyCode);
+
+    // The sale currency is selected independently from the
+    // original purchase currency.
+    const costCurrencyCode = getRecordCurrency(
+      latestItem.currencyCode
+    );
 
     const sale: SaleRecord = {
       id: `SALE-${Date.now()}`,
@@ -217,7 +241,8 @@ export default function Sales() {
       category: accessory ? "Accessory / spare part" : "Device",
       quantitySold: saleQuantity,
       unitPrice,
-      currencyCode,
+      currencyCode: saleCurrencyCode,
+      costCurrencyCode,
     };
 
     const updatedDevices = latestDevices.map((item) => {
@@ -261,6 +286,7 @@ export default function Sales() {
       setSalePrice("");
       setQuantity("1");
       setPaymentMethod("Cash");
+      setSaleCurrencyCode(getShopCurrency());
       setTransactionDate(new Date().toISOString().slice(0, 16));
 
       setNotice(
@@ -319,11 +345,25 @@ export default function Sales() {
                 onChange={(event) => {
                   const id = event.target.value;
                   setSelectedId(id);
+
                   const item = availableItems.find(
                     (record) => record.id === id
                   );
-                  setSalePrice(item?.sellingPrice ?? "");
+
+                  const itemCurrency = item
+                    ? getRecordCurrency(item.currencyCode)
+                    : null;
+
+                  // Only reuse the saved selling price when its
+                  // currency matches the selected sale currency.
+                  setSalePrice(
+                    item && itemCurrency === saleCurrencyCode
+                      ? item.sellingPrice ?? ""
+                      : ""
+                  );
+
                   setQuantity("1");
+                  setNotice("");
                 }}
               >
                 <option value="">Choose an item</option>
@@ -358,7 +398,10 @@ export default function Sales() {
                   </strong>
                   <p>{selectedItem.identifier}</p>
                   <p>
-                    Transaction currency: {saleCurrency}
+                    Original purchase currency: {purchaseCurrency}
+                  </p>
+                  <p>
+                    Customer sale currency: {saleCurrencyCode}
                   </p>
                   {selectedIsAccessory && (
                     <p>{availableQuantity} unit(s) currently available</p>
@@ -386,10 +429,30 @@ export default function Sales() {
             )}
 
             <label className="inventory-field">
+              <span>Sale currency</span>
+              <select
+                value={saleCurrencyCode}
+                onChange={(event) =>
+                  handleCurrencyChange(event.target.value)
+                }
+              >
+                {CURRENCY_OPTIONS.map((currency) => (
+                  <option key={currency.code} value={currency.code}>
+                    {currency.code}
+                  </option>
+                ))}
+              </select>
+              <small className="field-hint">
+                Choose the currency the customer will actually pay in.
+                This can differ from the purchase currency.
+              </small>
+            </label>
+
+            <label className="inventory-field">
               <span>
                 {selectedIsAccessory
-                  ? `Selling price per unit (${saleCurrency})`
-                  : `Selling price (${saleCurrency})`}
+                  ? `Selling price per unit (${saleCurrencyCode})`
+                  : `Selling price (${saleCurrencyCode})`}
               </span>
               <input
                 type="number"
@@ -406,7 +469,7 @@ export default function Sales() {
                 <Receipt size={18} />
                 <div>
                   <strong>Transaction total</strong>
-                  <p>{formatCurrency(totalPrice, saleCurrency)}</p>
+                  <p>{formatCurrency(totalPrice, saleCurrencyCode)}</p>
                 </div>
               </div>
             )}
@@ -508,6 +571,11 @@ export default function Sales() {
                       <span>
                         {sale.paymentMethod} · {sale.id}
                       </span>
+                      {sale.costCurrencyCode && (
+                        <span>
+                          Original cost currency: {sale.costCurrencyCode}
+                        </span>
+                      )}
                     </div>
                     <strong className="operations-amount">
                       {formatCurrency(sale.salePrice, currencyCode)}
