@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import {
   ArrowDownToLine,
   ArrowUpFromLine,
@@ -32,13 +32,42 @@ type DeviceRecord = {
   quantity?: number;
   secondaryIdentifiers?: string[];
   updated: string;
+  currencyCode?: string;
 };
 
-const initialDevices: DeviceRecord[] = [
-  { id: "1", brand: "Apple", model: "iPhone 15 · 128 GB", identifier: "DEMO-IMEI-001", status: "In shop", updated: "Today, 09:12" },
-  { id: "2", brand: "Samsung", model: "Galaxy A15 · 128 GB", identifier: "DEMO-IMEI-002", status: "With middle-man", updated: "Today, 08:44" },
-  { id: "3", brand: "Tecno", model: "Spark 20 · 256 GB", identifier: "DEMO-IMEI-003", status: "At repairer", updated: "Yesterday" },
-];
+function readLatestInventory(): DeviceRecord[] | null {
+  try {
+    const saved = localStorage.getItem("stockpilot-inventory");
+
+    if (!saved) {
+      return [];
+    }
+
+    const parsed: unknown = JSON.parse(saved);
+
+    if (!Array.isArray(parsed)) {
+      return null;
+    }
+
+    return parsed as DeviceRecord[];
+  } catch (error) {
+    console.error("Could not read latest inventory:", error);
+    return null;
+  }
+}
+
+function saveInventory(records: DeviceRecord[]): boolean {
+  try {
+    localStorage.setItem(
+      "stockpilot-inventory",
+      JSON.stringify(records)
+    );
+    return true;
+  } catch (error) {
+    console.error("Could not save inventory:", error);
+    return false;
+  }
+}
 
 export default function Inventory() {
   const [movement, setMovement] = useState<Movement>("Receive stock");
@@ -71,15 +100,8 @@ export default function Inventory() {
     console.error("Could not load saved inventory:", error);
   }
 
-  return initialDevices;
+  return [];
 });
-useEffect(() => {
-  try {
-    localStorage.setItem("stockpilot-inventory", JSON.stringify(devices));
-  } catch (error) {
-    console.error("Could not save inventory:", error);
-  }
-}, [devices]);
 
   const setIdentifier = useCallback((value: string) => {
     if (targetField === "imei1") setImei1(value);
@@ -92,53 +114,130 @@ useEffect(() => {
   ), [devices, search]);
 
   const handleSave = () => {
-    const identifier = imei1.trim() || serial.trim() || imei2.trim() || (category === "Accessory / spare part" ? model.trim() : "");
-    if (!identifier) {
-      setNotice(category === "Device" ? "Enter an IMEI or serial number, or scan a barcode first." : "Enter an accessory name/model or SKU/barcode.");
-      return;
-    }
-    if (category === "Device" && imei1.trim() && !/^\d{15}$/.test(imei1.trim())) {
-      setNotice("IMEI 1 should contain 15 digits. Check the number or use the serial-number field if this is not an IMEI.");
-      return;
-    }
-    if (category === "Device" && imei2.trim() && !/^\d{15}$/.test(imei2.trim())) {
-      setNotice("IMEI 2 should contain 15 digits. Leave it blank if this device has only one IMEI.");
+    setNotice("");
+
+    const latestDevices = readLatestInventory();
+
+    if (!latestDevices) {
+      setNotice(
+        "Could not read saved inventory. No changes were made. Please check your browser storage."
+      );
       return;
     }
 
-    const suppliedIdentifiers = [imei1.trim(), imei2.trim(), serial.trim(), identifier].filter(Boolean);
-    const matchedDevice = devices.find((device) => [device.identifier, ...(device.secondaryIdentifiers ?? [])].some((existing) => suppliedIdentifiers.some((value) => existing.toLowerCase() === value.toLowerCase())));
+    const identifier =
+      imei1.trim() ||
+      serial.trim() ||
+      imei2.trim() ||
+      (category === "Accessory / spare part" ? model.trim() : "");
+
+    if (!identifier) {
+      setNotice(
+        category === "Device"
+          ? "Enter an IMEI or serial number, or scan a barcode first."
+          : "Enter an accessory name/model or SKU/barcode."
+      );
+      return;
+    }
+
+    if (
+      category === "Device" &&
+      imei1.trim() &&
+      !/^\d{15}$/.test(imei1.trim())
+    ) {
+      setNotice(
+        "IMEI 1 should contain 15 digits. Check the number or use the serial-number field if this is not an IMEI."
+      );
+      return;
+    }
+
+    if (
+      category === "Device" &&
+      imei2.trim() &&
+      !/^\d{15}$/.test(imei2.trim())
+    ) {
+      setNotice(
+        "IMEI 2 should contain 15 digits. Leave it blank if this device has only one IMEI."
+      );
+      return;
+    }
+
+    if (
+      movement === "Receive stock" &&
+      category === "Accessory / spare part"
+    ) {
+      const quantityReceived = Number(quantity);
+
+      if (
+        !Number.isInteger(quantityReceived) ||
+        quantityReceived <= 0
+      ) {
+        setNotice("Enter a valid whole-number quantity.");
+        return;
+      }
+    }
+
+    const suppliedIdentifiers = [
+      imei1.trim(),
+      imei2.trim(),
+      serial.trim(),
+      identifier,
+    ].filter(Boolean);
+
+    const matchedDevice = latestDevices.find((device) =>
+      [device.identifier, ...(device.secondaryIdentifiers ?? [])].some(
+        (existing) =>
+          suppliedIdentifiers.some(
+            (value) => existing.toLowerCase() === value.toLowerCase()
+          )
+      )
+    );
 
     if (movement === "Record stock movement") {
       if (!matchedDevice) {
-        setNotice("No matching device was found in the demo inventory. Receive the device into stock first, or check the identifier.");
+        setNotice(
+          "No matching item was found in saved inventory. Receive the item into stock first, or check the identifier."
+        );
         return;
       }
-      setDevices((current) =>
-  current.map((device) =>
-    device.id === matchedDevice.id
-      ? {
-          ...device,
-          status: status as DeviceRecord["status"],
-          updated: "Just now",
-        }
-      : device
-  )
-);
-      setNotice(`Demo movement recorded for ${matchedDevice.brand} ${matchedDevice.model}: ${status}.`);
+
+      const updatedDevices = latestDevices.map((device) =>
+        device.id === matchedDevice.id
+          ? {
+              ...device,
+              status: status as DeviceRecord["status"],
+              updated: new Date().toISOString(),
+            }
+          : device
+      );
+
+      if (!saveInventory(updatedDevices)) {
+        setNotice(
+          "Could not save the stock movement. No changes were made."
+        );
+        return;
+      }
+
+      setDevices(updatedDevices);
+      setNotice(
+        `Stock movement recorded for ${matchedDevice.brand} ${matchedDevice.model}: ${status}.`
+      );
+
       setImei1("");
       setImei2("");
       setSerial("");
       return;
     }
 
-    const duplicate = devices.some((device) => [device.identifier, ...(device.secondaryIdentifiers ?? [])].some((existing) => suppliedIdentifiers.some((value) => existing.toLowerCase() === value.toLowerCase())));
-    if (duplicate) {
-      setNotice("This identifier already exists in the demo list. Review the existing device before adding another record.");
+    if (matchedDevice) {
+      setNotice(
+        "This identifier already exists in inventory. Review the existing record before adding another."
+      );
       return;
     }
+
     const record: DeviceRecord = {
-      id: `${Date.now()}`,
+      id: crypto.randomUUID(),
       brand: brand.trim() || "Unknown brand",
       model: model.trim() || "Model not specified",
       identifier,
@@ -150,12 +249,30 @@ useEffect(() => {
       costPrice: costPrice.trim() || undefined,
       sellingPrice: sellingPrice.trim() || undefined,
       category,
-      quantity: category === "Accessory / spare part" ? Math.max(1, Number.parseInt(quantity, 10) || 1) : 1,
-      secondaryIdentifiers: [imei1.trim(), imei2.trim(), serial.trim()].filter((value) => value && value !== identifier),
-      updated: "Just now",
+      quantity:
+        category === "Accessory / spare part"
+          ? Number(quantity)
+          : 1,
+      secondaryIdentifiers: [
+        imei1.trim(),
+        imei2.trim(),
+        serial.trim(),
+      ].filter((value) => value && value !== identifier),
+      updated: new Date().toISOString(),
     };
-    setDevices((current) => [record, ...current]);
-    setNotice("Demo device added to the inventory list.");
+
+    const updatedDevices = [record, ...latestDevices];
+
+    if (!saveInventory(updatedDevices)) {
+      setNotice(
+        "Could not save the new inventory record. No changes were made."
+      );
+      return;
+    }
+
+    setDevices(updatedDevices);
+    setNotice("Item added to inventory successfully.");
+
     setBrand("Apple");
     setModel("");
     setColour("");
