@@ -121,6 +121,61 @@ function saveStorage<T>(key: string, value: T) {
   localStorage.setItem(key, JSON.stringify(value));
 }
 
+type StorageEntry = {
+  key: string;
+  value: unknown;
+};
+
+function saveStorageBatch(entries: StorageEntry[]) {
+  const previousValues = new Map<string, string | null>();
+
+  // Capture the existing values before changing anything.
+  try {
+    for (const entry of entries) {
+      previousValues.set(entry.key, localStorage.getItem(entry.key));
+    }
+  } catch {
+    return {
+      success: false,
+      rollbackSucceeded: true,
+    };
+  }
+
+  // Attempt to save every record.
+  try {
+    for (const entry of entries) {
+      localStorage.setItem(entry.key, JSON.stringify(entry.value));
+    }
+
+    return {
+      success: true,
+      rollbackSucceeded: true,
+    };
+  } catch {
+    // If a save fails, attempt to restore all previous values.
+    let rollbackSucceeded = true;
+
+    const previousEntries = Array.from(previousValues.entries()).reverse();
+
+    for (const [key, previousValue] of previousEntries) {
+      try {
+        if (previousValue === null) {
+          localStorage.removeItem(key);
+        } else {
+          localStorage.setItem(key, previousValue);
+        }
+      } catch {
+        rollbackSucceeded = false;
+      }
+    }
+
+    return {
+      success: false,
+      rollbackSucceeded,
+    };
+  }
+}
+
 export default function Purchases() {
   const [purchases, setPurchases] = useState<PurchaseRecord[]>(() =>
     readStorage(PURCHASES_KEY, [])
@@ -315,6 +370,7 @@ export default function Purchases() {
     );
   };
 
+  
   const receivePurchase = (purchase: PurchaseRecord) => {
     setError("");
     setMessage("");
@@ -328,9 +384,9 @@ export default function Purchases() {
 
     const inventory = readStorage<InventoryRecord[]>(INVENTORY_KEY, []);
     const credits = readStorage<CreditRecord[]>(CREDIT_KEY, []);
-
     const updatedInventory = [...inventory];
 
+    // Check every device identifier before changing inventory.
     for (const item of purchase.items) {
       if (item.category === "Device") {
         for (const identifier of item.identifiers) {
@@ -361,6 +417,7 @@ export default function Purchases() {
       return;
     }
 
+    // Prepare inventory changes without saving them yet.
     for (const item of purchase.items) {
       if (item.category === "Device") {
         for (const identifier of item.identifiers) {
@@ -442,6 +499,7 @@ export default function Purchases() {
       }
     }
 
+    // Prepare the supplier credit record.
     const creditRecord: CreditRecord = {
       id: `CREDIT-${Date.now()}`,
       type: "Payable",
@@ -466,21 +524,52 @@ export default function Purchases() {
       currencyCode: purchaseCurrency,
     };
 
-    saveStorage(INVENTORY_KEY, updatedInventory);
-    saveStorage(CREDIT_KEY, [creditRecord, ...credits]);
+    const updatedCredits = [creditRecord, ...credits];
 
-    setPurchases((current) =>
-      current.map((record) =>
-        record.id === purchase.id
-          ? {
-              ...record,
-              status: "Received",
-              receivedAt: new Date().toISOString(),
-              currencyCode: purchaseCurrency,
-            }
-          : record
-      )
+    // Prepare the updated purchase history.
+    const updatedPurchases = purchases.map((record) =>
+      record.id === purchase.id
+        ? {
+            ...record,
+            status: "Received" as PurchaseStatus,
+            receivedAt: new Date().toISOString(),
+            currencyCode: purchaseCurrency,
+          }
+        : record
     );
+
+    // Save all three records together, restoring previous values if a save fails.
+    const result = saveStorageBatch([
+      {
+        key: INVENTORY_KEY,
+        value: updatedInventory,
+      },
+      {
+        key: CREDIT_KEY,
+        value: updatedCredits,
+      },
+      {
+        key: PURCHASES_KEY,
+        value: updatedPurchases,
+      },
+    ]);
+
+    if (!result.success) {
+      if (result.rollbackSucceeded) {
+        setError(
+          "Stock receiving could not be completed because a storage save failed. Previous records were restored. Please try again."
+        );
+      } else {
+        setError(
+          "Stock receiving encountered a storage error, and restoring every previous record could not be confirmed. Please check Inventory, Supplier Credit, and Purchase History before trying again."
+        );
+      }
+
+      return;
+    }
+
+    // Update the React interface only after all three saves succeed.
+    setPurchases(updatedPurchases);
 
     setMessage(
       `Stock received successfully. Inventory updated and supplier credit linked for ${purchase.supplier} in ${purchaseCurrency}.`
