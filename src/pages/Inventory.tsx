@@ -116,6 +116,13 @@ export default function Inventory() {
   const handleSave = () => {
     setNotice("");
 
+    if (movement === "Record stock movement" && status === "Sold") {
+      setNotice(
+        "Customer sales must be completed through Sales/POS. Inventory movements cannot mark an item as sold."
+      );
+      return;
+    }
+
     const latestDevices = readLatestInventory();
 
     if (!latestDevices) {
@@ -332,7 +339,10 @@ export default function Inventory() {
               <label className="inventory-field"><span>Approved selling price</span><input value={sellingPrice} onChange={(event) => setSellingPrice(event.target.value)} placeholder="Optional amount" inputMode="decimal" /></label>
             </>}
 
-            {movement === "Record stock movement" && <label className="inventory-field inventory-field-wide"><span>Movement type</span><select value={status} onChange={(event) => setStatus(event.target.value)}><option value="Sold">Sold to customer</option><option value="With middle-man">Handed to middle-man</option><option value="At repairer">Sent to repairer</option><option value="In shop">Returned to shop</option></select></label>}
+            {movement === "Record stock movement" && <>
+              <label className="inventory-field inventory-field-wide"><span>Movement type</span><select value={status} onChange={(event) => setStatus(event.target.value)}><option value="With middle-man">Handed to middle-man</option><option value="At repairer">Sent to repairer</option><option value="In shop">Returned to shop</option></select></label>
+              <p className="field-hint inventory-field-wide" role="note">Customer sales must be completed through Sales/POS so the sale transaction and inventory update are recorded together.</p>
+            </>}
 
             <div className="inventory-field inventory-field-wide">
               <span>{category === "Device" ? "Unique device identifier" : "Item identifier"} <em>{category === "Device" ? "IMEI or serial" : "SKU or barcode optional"}</em></span>
