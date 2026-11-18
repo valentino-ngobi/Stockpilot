@@ -9,10 +9,13 @@ import {
 } from "lucide-react";
 import {
   formatCurrency,
-  getRecordCurrency,
+  getKnownSaleAmount,
+  getKnownRecordCurrency,
   getShopCurrency,
+  SETTINGS_STORAGE_KEY,
   type CurrencyCode,
 } from "../utils/currency";
+import { getKnownPaymentMethod } from "../utils/sales";
 
 const SALES_KEY = "stockpilot-sales";
 const CLOSINGS_KEY = "stockpilot-daily-closings";
@@ -26,7 +29,7 @@ type SaleRecord = {
 };
 
 type CurrencyClosingSummary = {
-  currencyCode: CurrencyCode;
+  currencyCode: CurrencyCode | null;
   openingCash: number;
   cashReceived: number;
   cashPaidOut: number;
@@ -71,16 +74,39 @@ type CurrencySalesSummary = {
   transactionCount: number;
 };
 
-function readStorage<T>(key: string): T[] {
-  try {
-    const saved = localStorage.getItem(key);
-    if (!saved) return [];
+type StoredArraySnapshot<T> = {
+  raw: string | null;
+  records: T[];
+};
 
-    const parsed: unknown = JSON.parse(saved);
-    return Array.isArray(parsed) ? (parsed as T[]) : [];
+type StoredArrayReadState<T> = {
+  records: T[];
+  hasValidSnapshot: boolean;
+  readError: boolean;
+};
+
+function readStoredArray<T>(key: string): StoredArraySnapshot<T> | null {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw === null) return { raw, records: [] };
+
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+
+    return { raw, records: parsed as T[] };
   } catch {
-    return [];
+    return null;
   }
+}
+
+function toStoredArrayReadState<T>(
+  snapshot: StoredArraySnapshot<T> | null
+): StoredArrayReadState<T> {
+  return {
+    records: snapshot?.records ?? [],
+    hasValidSnapshot: snapshot !== null,
+    readError: snapshot === null,
+  };
 }
 
 function getLocalDateKey(date: Date) {
@@ -91,10 +117,39 @@ function getLocalDateKey(date: Date) {
   return `${year}-${month}-${day}`;
 }
 
-function formatMoney(amount: number, currencyCode: CurrencyCode) {
-  return formatCurrency(
-    Number.isFinite(amount) ? amount : 0,
-    currencyCode
+function formatMoney(amount: number, currencyCode: CurrencyCode | null) {
+  return formatCurrency(amount, currencyCode);
+}
+
+function getCurrencyLabel(currencyCode: CurrencyCode | null) {
+  return currencyCode ?? "Currency unavailable";
+}
+
+function getStoredAmount(value: unknown, allowNegative = false): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return Number.NaN;
+  }
+  return allowNegative || value >= 0 ? value : Number.NaN;
+}
+
+function getStoredCount(value: unknown): number {
+  return typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0
+    ? value
+    : Number.NaN;
+}
+
+function getStoredPaymentTotals(value: unknown): Record<string, number> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+
+  return Object.fromEntries(
+    Object.entries(value).map(([method, amount]) => [
+      method,
+      getStoredAmount(amount),
+    ])
   );
 }
 
@@ -121,35 +176,58 @@ function getClosingSummaries(
     Array.isArray(closing.currencySummaries) &&
     closing.currencySummaries.length > 0
   ) {
-    return closing.currencySummaries;
+    return closing.currencySummaries.map((value) => {
+      const summary =
+        value !== null && typeof value === "object"
+          ? (value as unknown as Record<string, unknown>)
+          : {};
+      return {
+        currencyCode: getKnownRecordCurrency(summary.currencyCode),
+        openingCash: getStoredAmount(summary.openingCash),
+        cashReceived: getStoredAmount(summary.cashReceived),
+        cashPaidOut: getStoredAmount(summary.cashPaidOut),
+        expectedCash: getStoredAmount(summary.expectedCash),
+        actualCash: getStoredAmount(summary.actualCash),
+        difference: getStoredAmount(summary.difference, true),
+        totalSales: getStoredAmount(summary.totalSales),
+        transactionCount: getStoredCount(summary.transactionCount),
+        paymentTotals: getStoredPaymentTotals(summary.paymentTotals),
+      };
+    });
   }
 
-  // Old closing records did not store a currency code.
-  // Their amounts are treated as UGX without changing the saved data.
+  // Old closing records did not store a currency code, so their currency
+  // cannot be recovered safely.
   return [
     {
-      currencyCode: "UGX",
-      openingCash: Number(closing.openingCash) || 0,
-      cashReceived: Number(closing.cashReceived) || 0,
-      cashPaidOut: Number(closing.cashPaidOut) || 0,
-      expectedCash: Number(closing.expectedCash) || 0,
-      actualCash: Number(closing.actualCash) || 0,
-      difference: Number(closing.difference) || 0,
-      totalSales: Number(closing.totalSales) || 0,
-      transactionCount: Number(closing.transactionCount) || 0,
-      paymentTotals: closing.paymentTotals || {},
+      currencyCode: null,
+      openingCash: getStoredAmount(closing.openingCash),
+      cashReceived: getStoredAmount(closing.cashReceived),
+      cashPaidOut: getStoredAmount(closing.cashPaidOut),
+      expectedCash: getStoredAmount(closing.expectedCash),
+      actualCash: getStoredAmount(closing.actualCash),
+      difference: getStoredAmount(closing.difference, true),
+      totalSales: getStoredAmount(closing.totalSales),
+      transactionCount: getStoredCount(closing.transactionCount),
+      paymentTotals: getStoredPaymentTotals(closing.paymentTotals),
     },
   ];
 }
 
 export default function DailyClosing() {
-  const [sales, setSales] = useState<SaleRecord[]>(() =>
-    readStorage<SaleRecord>(SALES_KEY)
+  const [salesReadState, setSalesReadState] = useState(() =>
+    toStoredArrayReadState(readStoredArray<SaleRecord>(SALES_KEY))
   );
+  const sales = salesReadState.records;
 
-  const [closings, setClosings] = useState<ClosingRecord[]>(() =>
-    readStorage<ClosingRecord>(CLOSINGS_KEY)
+  const [closingsReadState, setClosingsReadState] = useState(() =>
+    toStoredArrayReadState(readStoredArray<ClosingRecord>(CLOSINGS_KEY))
   );
+  const closings = closingsReadState.records;
+  const [shopCurrency, setShopCurrency] = useState<CurrencyCode | null>(
+    () => getShopCurrency()
+  );
+  const [reviewRequired, setReviewRequired] = useState(false);
 
   const [selectedDate, setSelectedDate] = useState(() =>
     getLocalDateKey(new Date())
@@ -162,19 +240,82 @@ export default function DailyClosing() {
   const [notice, setNotice] = useState("");
 
   useEffect(() => {
-    const refreshData = () => {
-      setSales(readStorage<SaleRecord>(SALES_KEY));
-      setClosings(readStorage<ClosingRecord>(CLOSINGS_KEY));
-    };
+    const refreshData = (event?: StorageEvent) => {
+      if (
+        event &&
+        event.key !== SALES_KEY &&
+        event.key !== CLOSINGS_KEY &&
+        event.key !== SETTINGS_STORAGE_KEY &&
+        event.key !== null
+      ) {
+        return;
+      }
 
-    window.addEventListener("focus", refreshData);
+      if (!event || event.key === SALES_KEY || event.key === null) {
+        const latestSales = readStoredArray<SaleRecord>(SALES_KEY);
+        if (latestSales) {
+          const salesChanged =
+            JSON.stringify(latestSales.records) !== JSON.stringify(sales);
+          setSalesReadState((current) => ({
+            records: salesChanged ? latestSales.records : current.records,
+            hasValidSnapshot: true,
+            readError: false,
+          }));
+
+          if (salesChanged) {
+            setReviewRequired(true);
+            setNotice(
+              "Sales changed in another tab. Review the updated figures and cash entries before saving the closing."
+            );
+          }
+        } else {
+          setSalesReadState((current) => ({ ...current, readError: true }));
+        }
+      }
+
+      if (!event || event.key === CLOSINGS_KEY || event.key === null) {
+        const latestClosings = readStoredArray<ClosingRecord>(CLOSINGS_KEY);
+        if (latestClosings) {
+          setClosingsReadState((current) => ({
+            records:
+              JSON.stringify(current.records) ===
+              JSON.stringify(latestClosings.records)
+                ? current.records
+                : latestClosings.records,
+            hasValidSnapshot: true,
+            readError: false,
+          }));
+        } else {
+          setClosingsReadState((current) => ({ ...current, readError: true }));
+        }
+      }
+
+      if (!event || event.key === SETTINGS_STORAGE_KEY || event.key === null) {
+        const latestShopCurrency = getShopCurrency();
+        if (latestShopCurrency !== shopCurrency) {
+          setShopCurrency(latestShopCurrency);
+          setReviewRequired(true);
+          setNotice(
+            latestShopCurrency
+              ? "Shop currency changed in another tab. Review the updated closing figures and cash entries before saving."
+              : "Shop currency settings are invalid or unavailable. No closing can be saved until they are corrected."
+          );
+        }
+      }
+    };
+    const refreshOnFocus = () => refreshData();
+
+    window.addEventListener("focus", refreshOnFocus);
     window.addEventListener("storage", refreshData);
 
     return () => {
-      window.removeEventListener("focus", refreshData);
+      window.removeEventListener("focus", refreshOnFocus);
       window.removeEventListener("storage", refreshData);
     };
-  }, []);
+  }, [sales, shopCurrency]);
+
+  const hasSalesSnapshot = salesReadState.hasValidSnapshot;
+  const hasClosingsSnapshot = closingsReadState.hasValidSnapshot;
 
   const dailySales = useMemo(() => {
     return sales.filter((sale) => {
@@ -187,11 +328,30 @@ export default function DailyClosing() {
     });
   }, [sales, selectedDate]);
 
+  const unresolvedCurrencySales = useMemo(
+    () => dailySales.filter((sale) => !getKnownRecordCurrency(sale.currencyCode)),
+    [dailySales]
+  );
+
+  const invalidAmountSales = useMemo(
+    () => dailySales.filter((sale) => getKnownSaleAmount(sale.salePrice) === null),
+    [dailySales]
+  );
+
+  const unknownPaymentMethodSales = useMemo(
+    () =>
+      dailySales.filter(
+        (sale) => getKnownPaymentMethod(sale.paymentMethod) === null
+      ),
+    [dailySales]
+  );
+
   const currencySummaries = useMemo(() => {
     const grouped = new Map<string, CurrencySalesSummary>();
 
     dailySales.forEach((sale) => {
-      const currencyCode = getRecordCurrency(sale.currencyCode);
+      const currencyCode = getKnownRecordCurrency(sale.currencyCode);
+      if (!currencyCode) return;
 
       if (!grouped.has(currencyCode)) {
         grouped.set(currencyCode, {
@@ -205,27 +365,48 @@ export default function DailyClosing() {
       }
 
       const summary = grouped.get(currencyCode)!;
-      const amount = Number(sale.salePrice) || 0;
-      const method = sale.paymentMethod || "Other";
+      const amount = getKnownSaleAmount(sale.salePrice);
+      if (amount === null) return;
+      const method = getKnownPaymentMethod(sale.paymentMethod);
+      const salesTotal = summary.totalSales + amount;
+      if (!Number.isFinite(salesTotal)) {
+        summary.totalSales = Number.NaN;
+        return;
+      }
 
-      summary.paymentTotals[method] =
-        (summary.paymentTotals[method] || 0) + amount;
-
-      summary.totalSales += amount;
+      summary.totalSales = salesTotal;
       summary.transactionCount += 1;
+      if (!method) return;
+
+      const paymentTotal = (summary.paymentTotals[method] || 0) + amount;
+      const receivedTotal =
+        method === "Cash"
+          ? summary.cashReceived + amount
+          : summary.nonCashReceived + amount;
+      if (
+        !Number.isFinite(paymentTotal) ||
+        !Number.isFinite(salesTotal) ||
+        !Number.isFinite(receivedTotal)
+      ) {
+        summary.paymentTotals[method] = Number.NaN;
+        summary.totalSales = Number.NaN;
+        if (method === "Cash") summary.cashReceived = Number.NaN;
+        else summary.nonCashReceived = Number.NaN;
+        return;
+      }
+
+      summary.paymentTotals[method] = paymentTotal;
 
       if (method === "Cash") {
-        summary.cashReceived += amount;
+        summary.cashReceived = receivedTotal;
       } else {
-        summary.nonCashReceived += amount;
+        summary.nonCashReceived = receivedTotal;
       }
     });
 
     // Include the shop's operating currency even if there were no sales
     // in that currency, so the shop can still reconcile its cash drawer.
-    const shopCurrency = getShopCurrency();
-
-    if (!grouped.has(shopCurrency)) {
+    if (shopCurrency && !grouped.has(shopCurrency)) {
       grouped.set(shopCurrency, {
         currencyCode: shopCurrency,
         paymentTotals: {},
@@ -236,10 +417,36 @@ export default function DailyClosing() {
       });
     }
 
+    // Keep cash entries visible and saveable if a cross-tab change removes
+    // their currency from the current sales and shop-currency summaries.
+    Object.keys(cashInputs).forEach((code) => {
+      const currencyCode = code as CurrencyCode;
+      if (!grouped.has(currencyCode)) {
+        grouped.set(currencyCode, {
+          currencyCode,
+          paymentTotals: {},
+          totalSales: 0,
+          cashReceived: 0,
+          nonCashReceived: 0,
+          transactionCount: 0,
+        });
+      }
+    });
+
     return Array.from(grouped.values()).sort((a, b) =>
       a.currencyCode.localeCompare(b.currencyCode)
     );
-  }, [dailySales]);
+  }, [dailySales, shopCurrency, cashInputs]);
+
+  const hasInvalidSummaryTotals = currencySummaries.some(
+    (summary) =>
+      !Number.isFinite(summary.totalSales) ||
+      !Number.isFinite(summary.cashReceived) ||
+      !Number.isFinite(summary.nonCashReceived) ||
+      Object.values(summary.paymentTotals).some(
+        (amount) => !Number.isFinite(amount)
+      )
+  );
 
   const existingClosing = closings.find(
     (closing) => closing.date === selectedDate
@@ -301,6 +508,8 @@ export default function DailyClosing() {
     const difference = validActual
       ? counted - expectedCash
       : 0;
+    const validExpected =
+      Number.isFinite(expectedCash) && Number.isFinite(difference);
 
     return {
       inputs,
@@ -310,6 +519,7 @@ export default function DailyClosing() {
       validOpening,
       validPaidOut,
       validActual,
+      validExpected,
       expectedCash,
       difference,
     };
@@ -317,6 +527,87 @@ export default function DailyClosing() {
 
   const saveClosing = () => {
     setNotice("");
+
+    const latestSales = readStoredArray<SaleRecord>(SALES_KEY);
+    const latestClosings = readStoredArray<ClosingRecord>(CLOSINGS_KEY);
+
+    if (!latestSales || !latestClosings) {
+      setNotice(
+        "Could not safely read saved sales or closing records. No closing was saved; check browser storage before trying again."
+      );
+      return;
+    }
+
+    if (JSON.stringify(latestSales.records) !== JSON.stringify(sales)) {
+      setSalesReadState({
+        records: latestSales.records,
+        hasValidSnapshot: true,
+        readError: false,
+      });
+      setClosingsReadState({
+        records: latestClosings.records,
+        hasValidSnapshot: true,
+        readError: false,
+      });
+      setReviewRequired(true);
+      setNotice(
+        "Sales changed in another tab. The latest sales were loaded; review the closing totals and save again."
+      );
+      return;
+    }
+
+    if (unresolvedCurrencySales.length > 0) {
+      setNotice(
+        `Cannot save this closing: ${unresolvedCurrencySales.length} sale(s) have no valid saved currency. Review those records before closing; they were excluded from currency totals.`
+      );
+      return;
+    }
+
+    if (invalidAmountSales.length > 0) {
+      setNotice(
+        `Cannot save this closing: ${invalidAmountSales.length} sale(s) have invalid, negative, or non-finite amounts. They were excluded from currency totals; review those records before closing.`
+      );
+      return;
+    }
+
+    if (unknownPaymentMethodSales.length > 0) {
+      setNotice(
+        `Cannot save this closing: ${unknownPaymentMethodSales.length} sale(s) have a missing or unsupported payment method. Resolve them before reconciling physical cash.`
+      );
+      return;
+    }
+
+    if (hasInvalidSummaryTotals) {
+      setNotice(
+        "Cannot save this closing: one or more currency totals are outside the supported numeric range."
+      );
+      return;
+    }
+
+    const latestShopCurrency = getShopCurrency();
+    if (!latestShopCurrency) {
+      setShopCurrency(null);
+      setNotice(
+        "Shop currency settings are invalid or unavailable. No closing was saved; review Workspace settings first."
+      );
+      return;
+    }
+
+    if (latestShopCurrency !== shopCurrency) {
+      setShopCurrency(latestShopCurrency);
+      setReviewRequired(true);
+      setNotice(
+        "Shop currency changed in another tab. Review the updated figures and cash entries, then save again."
+      );
+      return;
+    }
+
+    if (reviewRequired) {
+      setNotice(
+        "Review the updated sales figures and cash entries, then acknowledge before saving the closing."
+      );
+      return;
+    }
 
     const reconciliations = currencySummaries.map((summary) => ({
       summary,
@@ -337,6 +628,9 @@ export default function DailyClosing() {
 
     const negativeExpected = reconciliations.some(
       ({ reconciliation }) => reconciliation.expectedCash < 0
+    );
+    const invalidExpected = reconciliations.some(
+      ({ reconciliation }) => !reconciliation.validExpected
     );
 
     if (invalidOpening || invalidPaidOut) {
@@ -360,15 +654,23 @@ export default function DailyClosing() {
       return;
     }
 
-    const latestClosings =
-      readStorage<ClosingRecord>(CLOSINGS_KEY);
+    if (invalidExpected) {
+      setNotice(
+        "A cash reconciliation total is outside the supported numeric range. Check the sales and cash entries before saving."
+      );
+      return;
+    }
 
     if (
-      latestClosings.some(
+      latestClosings.records.some(
         (closing) => closing.date === selectedDate
       )
     ) {
-      setClosings(latestClosings);
+      setClosingsReadState({
+        records: latestClosings.records,
+        hasValidSnapshot: true,
+        readError: false,
+      });
       setNotice("A closing already exists for this date.");
       return;
     }
@@ -395,16 +697,36 @@ export default function DailyClosing() {
     };
 
     try {
-      const updated = [...latestClosings, record];
+      if (localStorage.getItem(CLOSINGS_KEY) !== latestClosings.raw) {
+        const currentClosings = readStoredArray<ClosingRecord>(CLOSINGS_KEY);
+        if (currentClosings) {
+          setClosingsReadState({
+            records: currentClosings.records,
+            hasValidSnapshot: true,
+            readError: false,
+          });
+        }
+        setNotice(
+          "Closing records changed in another tab. The latest records were loaded; review and try again."
+        );
+        return;
+      }
+
+      const updated = [...latestClosings.records, record];
 
       localStorage.setItem(
         CLOSINGS_KEY,
         JSON.stringify(updated)
       );
 
-      setClosings(updated);
+      setClosingsReadState({
+        records: updated,
+        hasValidSnapshot: true,
+        readError: false,
+      });
       setNotice("Daily closing saved successfully.");
       setCashInputs({});
+      setReviewRequired(false);
     } catch {
       setNotice(
         "Unable to save closing. Check available browser storage."
@@ -431,6 +753,26 @@ export default function DailyClosing() {
           <ClipboardCheck size={22} />
         </div>
       </div>
+
+      {(salesReadState.readError || closingsReadState.readError) && (
+        <div className="operations-note" role="alert">
+          <strong>Some daily closing data could not be read.</strong>{" "}
+          {salesReadState.readError && (
+            <span>
+              {hasSalesSnapshot
+                ? "The latest sales read failed; showing the last successfully loaded sales, so figures may be out of date. "
+                : "Sales data is unavailable. "}
+            </span>
+          )}
+          {closingsReadState.readError && (
+            <span>
+              {hasClosingsSnapshot
+                ? "The latest closing-record read failed; showing the last successfully loaded closings, so they may be out of date."
+                : "Closing records are unavailable."}
+            </span>
+          )}
+        </div>
+      )}
 
       <section className="surface-card daily-closing-date">
         <div>
@@ -467,17 +809,116 @@ export default function DailyClosing() {
         </div>
       )}
 
+      {unresolvedCurrencySales.length > 0 && (
+        <div className="operations-note" role="alert">
+          <strong>
+            {unresolvedCurrencySales.length} sale(s) have an unavailable currency.
+          </strong>
+          <span>
+            They are excluded from currency totals, and this closing cannot be
+            saved until their currency is resolved.
+          </span>
+          <ul>
+            {unresolvedCurrencySales.map((sale) => (
+              <li key={sale.id}>
+                {sale.id}: {formatMoney(sale.salePrice, null)}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {invalidAmountSales.length > 0 && (
+        <div className="operations-note" role="alert">
+          <strong>
+            {invalidAmountSales.length} sale(s) have an invalid amount.
+          </strong>
+          <span>
+            Invalid, negative, or non-finite amounts are excluded from totals.
+            Resolve these records before saving this closing.
+          </span>
+          <ul>
+            {invalidAmountSales.map((sale) => (
+              <li key={sale.id}>
+                {sale.id}:{" "}
+                {formatMoney(
+                  sale.salePrice,
+                  getKnownRecordCurrency(sale.currencyCode)
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {unknownPaymentMethodSales.length > 0 && (
+        <div className="operations-note" role="alert">
+          <strong>
+            {unknownPaymentMethodSales.length} sale(s) have an unavailable
+            payment method.
+          </strong>
+          <span>
+            Their currency totals are included, but they cannot be assigned to
+            cash or non-cash collections. Resolve these records before saving
+            the closing.
+          </span>
+        </div>
+      )}
+
+      {hasInvalidSummaryTotals && (
+        <div className="operations-note" role="alert">
+          One or more currency totals exceed the supported numeric range.
+          This closing cannot be saved until the contributing records are
+          reviewed.
+        </div>
+      )}
+
+      {!shopCurrency && (
+        <div className="operations-note" role="status">
+          Shop currency settings are invalid or unavailable. Daily closing is
+          blocked until Workspace settings are corrected.
+        </div>
+      )}
+
+      {reviewRequired && (
+        <div className="operations-note" role="status">
+          Sales or shop currency changed in another tab. Review the updated
+          figures and recheck your cash entries. Your entered cash values have
+          been kept.
+          <button
+            className="button button-secondary"
+            type="button"
+            onClick={() => {
+              setReviewRequired(false);
+              setNotice("Review acknowledged. Verify cash entries before saving.");
+            }}
+          >
+            I reviewed the updated figures
+          </button>
+        </div>
+      )}
+
       <div className="daily-closing-grid">
         <section className="surface-card daily-closing-card">
           <div className="inventory-card-heading">
             <div>
               <div className="card-kicker">DAILY COLLECTIONS</div>
               <h2>Sales by currency</h2>
+              <p className="operations-report-empty">
+                Each sale records one payment method for its full amount;
+                partial customer payments are not supported.
+              </p>
             </div>
             <Wallet size={19} />
           </div>
 
-          {currencySummaries.map((summary) => (
+          {!hasSalesSnapshot ? (
+            <div className="inventory-empty">
+              <Wallet size={24} />
+              <strong>Sales data unavailable</strong>
+              <span>Browser sales data could not be read.</span>
+            </div>
+          ) : currencySummaries.map((summary) => (
             <div
               className="daily-closing-currency-section"
               key={summary.currencyCode}
@@ -497,9 +938,15 @@ export default function DailyClosing() {
               <div className="operations-report-payments">
                 {Object.keys(summary.paymentTotals).length === 0 ? (
                   <div className="operations-report-payment">
-                    <span>No sales recorded</span>
+                    <span>
+                      {summary.transactionCount === 0
+                        ? "No sales recorded"
+                        : "No recognized payment methods"}
+                    </span>
                     <strong>
-                      {formatMoney(0, summary.currencyCode)}
+                      {summary.transactionCount === 0
+                        ? formatMoney(0, summary.currencyCode)
+                        : "Unavailable"}
                     </strong>
                   </div>
                 ) : (
@@ -555,7 +1002,17 @@ export default function DailyClosing() {
             <ClipboardCheck size={19} />
           </div>
 
-          {currencySummaries.map((summary) => {
+          {!hasSalesSnapshot || !hasClosingsSnapshot ? (
+            <div className="inventory-empty">
+              <ClipboardCheck size={24} />
+              <strong>Cash reconciliation unavailable</strong>
+              <span>
+                {!hasSalesSnapshot
+                  ? "Sales data could not be read."
+                  : "Closing records could not be read, so the existing closing status cannot be verified."}
+              </span>
+            </div>
+          ) : currencySummaries.map((summary) => {
             const reconciliation = getReconciliation(summary);
             const {
               inputs,
@@ -695,12 +1152,33 @@ export default function DailyClosing() {
           <button
             className="button button-primary"
             onClick={saveClosing}
-            disabled={Boolean(existingClosing)}
+            disabled={
+              Boolean(existingClosing) ||
+              unresolvedCurrencySales.length > 0 ||
+              invalidAmountSales.length > 0 ||
+              unknownPaymentMethodSales.length > 0 ||
+              hasInvalidSummaryTotals ||
+              !hasSalesSnapshot ||
+              !hasClosingsSnapshot ||
+              !shopCurrency
+            }
           >
             <CheckCircle2 size={16} />
             {existingClosing
               ? "Already closed"
-              : "Save daily closing"}
+              : unresolvedCurrencySales.length > 0
+                ? "Resolve sale currencies before closing"
+                : invalidAmountSales.length > 0
+                  ? "Resolve invalid sale amounts before closing"
+                : unknownPaymentMethodSales.length > 0
+                  ? "Resolve unknown payment methods before closing"
+                : hasInvalidSummaryTotals
+                  ? "Sales totals unavailable"
+                : !hasSalesSnapshot || !hasClosingsSnapshot
+                  ? "Storage data unavailable"
+                : !shopCurrency
+                  ? "Shop currency unavailable"
+                  : "Save daily closing"}
           </button>
         </section>
       </div>
@@ -710,15 +1188,15 @@ export default function DailyClosing() {
           <div className="card-kicker">SAVED RECONCILIATION</div>
           <h2>Closing summary</h2>
 
-          {getClosingSummaries(existingClosing).map((summary) => (
+          {getClosingSummaries(existingClosing).map((summary, index) => (
             <div
               className="daily-closing-currency-section"
-              key={summary.currencyCode}
+              key={(summary.currencyCode ?? "unknown") + "-" + index}
             >
               <div className="operations-report-divider" />
 
               <div className="daily-closing-total">
-                <strong>{summary.currencyCode}</strong>
+                <strong>{getCurrencyLabel(summary.currencyCode)}</strong>
                 <strong>
                   {formatMoney(
                     summary.totalSales,
@@ -795,11 +1273,17 @@ export default function DailyClosing() {
             <h2>Previous closings</h2>
           </div>
           <span className="inventory-count">
-            {closings.length} saved
+            {hasClosingsSnapshot ? `${closings.length} saved` : "Unavailable"}
           </span>
         </div>
 
-        {sortedClosings.length === 0 ? (
+        {!hasClosingsSnapshot ? (
+          <div className="inventory-empty">
+            <History size={24} />
+            <strong>Closing records unavailable</strong>
+            <span>Browser closing data could not be read.</span>
+          </div>
+        ) : sortedClosings.length === 0 ? (
           <div className="inventory-empty">
             <History size={24} />
             <strong>No closing records yet</strong>
@@ -824,9 +1308,9 @@ export default function DailyClosing() {
                   <div className="operations-record-copy">
                     <strong>{formatDate(closing.date)}</strong>
 
-                    {summaries.map((summary) => (
-                      <span key={summary.currencyCode}>
-                        {summary.currencyCode}:{" "}
+                    {summaries.map((summary, index) => (
+                      <span key={(summary.currencyCode ?? "unknown") + "-" + index}>
+                        {getCurrencyLabel(summary.currencyCode)}:{" "}
                         {summary.transactionCount} transactions ·
                         Expected{" "}
                         {formatMoney(
@@ -843,16 +1327,16 @@ export default function DailyClosing() {
                   </div>
 
                   <div className="operations-record-copy">
-                    {summaries.map((summary) => (
+                    {summaries.map((summary, index) => (
                       <strong
                         className={`operations-amount ${
                           summary.difference < 0
                             ? "report-negative"
                             : ""
                         }`}
-                        key={summary.currencyCode}
+                        key={(summary.currencyCode ?? "unknown") + "-" + index}
                       >
-                        {summary.currencyCode}:{" "}
+                        {getCurrencyLabel(summary.currencyCode)}:{" "}
                         {summary.difference > 0 ? "+" : ""}
                         {formatMoney(
                           summary.difference,

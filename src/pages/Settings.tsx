@@ -1,5 +1,5 @@
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Building2,
   CheckCircle2,
@@ -10,22 +10,110 @@ import {
 } from "lucide-react";
 import {
   CURRENCY_OPTIONS,
-  getShopSettings,
+  getShopSettingsSnapshot,
+  SETTINGS_STORAGE_KEY,
   saveShopSettings,
   type CurrencyCode,
 } from "../utils/currency";
 
+function getRecoverableShopName(
+  snapshot: ReturnType<typeof getShopSettingsSnapshot>,
+): string {
+  if (snapshot.status === "valid" || snapshot.status === "missing") {
+    return snapshot.settings.shopName;
+  }
+
+  const savedShopName =
+    snapshot.status === "invalid"
+      ? snapshot.storedFields?.shopName
+      : undefined;
+
+  return typeof savedShopName === "string" && savedShopName.trim()
+    ? savedShopName
+    : "";
+}
+
 export default function Settings() {
+  const [savedSnapshot, setSavedSnapshot] = useState(
+    () => getShopSettingsSnapshot()
+  );
+
   const [shopName, setShopName] = useState(
-    () => getShopSettings().shopName
+    () => getRecoverableShopName(savedSnapshot)
   );
 
   const [currencyCode, setCurrencyCode] = useState<CurrencyCode>(
-    () => getShopSettings().currencyCode
+    () =>
+      savedSnapshot.status === "valid" || savedSnapshot.status === "missing"
+        ? savedSnapshot.settings.currencyCode
+        : ""
   );
 
   const [currencySearch, setCurrencySearch] = useState("");
-  const [notice, setNotice] = useState("");
+  const [notice, setNotice] = useState(() =>
+    savedSnapshot.status === "invalid" || savedSnapshot.status === "unavailable"
+      ? savedSnapshot.message
+      : ""
+  );
+  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+  const [currencyExplicitlySelected, setCurrencyExplicitlySelected] =
+    useState(
+      () =>
+        savedSnapshot.status === "valid" ||
+        savedSnapshot.status === "missing"
+    );
+
+  useEffect(() => {
+    const refreshSettings = (event?: StorageEvent) => {
+      if (
+        event &&
+        event.key !== SETTINGS_STORAGE_KEY &&
+        event.key !== null
+      ) {
+        return;
+      }
+
+      const latest = getShopSettingsSnapshot();
+
+      if (hasUnsavedChanges) {
+        if (
+          latest.raw !== savedSnapshot.raw ||
+          latest.status !== savedSnapshot.status
+        ) {
+          setNotice(
+            "Settings changed in another tab. Your unsaved values are kept until you save or review the latest settings."
+          );
+        }
+        return;
+      }
+
+      setSavedSnapshot((current) =>
+        JSON.stringify(current) === JSON.stringify(latest)
+          ? current
+          : latest
+      );
+
+      if (latest.status === "valid" || latest.status === "missing") {
+        setShopName(latest.settings.shopName);
+        setCurrencyCode(latest.settings.currencyCode);
+        setCurrencyExplicitlySelected(false);
+        setNotice("");
+      } else {
+        setShopName(getRecoverableShopName(latest));
+        setCurrencyCode("");
+        setCurrencyExplicitlySelected(false);
+        setNotice(latest.message);
+      }
+    };
+    const refreshOnFocus = () => refreshSettings();
+
+    window.addEventListener("storage", refreshSettings);
+    window.addEventListener("focus", refreshOnFocus);
+    return () => {
+      window.removeEventListener("storage", refreshSettings);
+      window.removeEventListener("focus", refreshOnFocus);
+    };
+  }, [hasUnsavedChanges, savedSnapshot]);
 
   const filteredCurrencies = useMemo(() => {
     const search = currencySearch.trim().toLowerCase();
@@ -43,19 +131,122 @@ export default function Settings() {
     (currency) => currency.code === currencyCode
   );
 
+  const getSettingsEditNotice = (
+    currencySelected = currencyExplicitlySelected
+  ) => {
+    if (savedSnapshot.status === "invalid") {
+      return currencySelected
+        ? `${savedSnapshot.message} The saved value is unchanged; click Save to replace it with these valid settings.`
+        : `${savedSnapshot.message} The saved value is unchanged; choose a currency explicitly before saving.`;
+    }
+
+    if (savedSnapshot.status === "unavailable") {
+      return savedSnapshot.message;
+    }
+
+    return "";
+  };
+
   const handleSave = () => {
     const cleanedName = shopName.trim();
 
     if (!cleanedName) {
-      setNotice("Enter a shop name before saving.");
+      setNotice(
+        savedSnapshot.status === "invalid" &&
+          !getRecoverableShopName(savedSnapshot)
+          ? "The saved shop name could not be recovered safely. Enter the shop name manually before saving."
+          : "Enter a shop name before saving."
+      );
       return;
     }
 
-    saveShopSettings({
+    if (savedSnapshot.status === "invalid") {
+      if (!currencyExplicitlySelected) {
+        setNotice(
+          `${savedSnapshot.message} Choose a currency explicitly to repair it; saved settings have not been changed.`
+        );
+        return;
+      }
+    }
+
+    if (savedSnapshot.status === "unavailable") {
+      setNotice(
+        `${savedSnapshot.message} No changes were made; check browser storage before trying again.`
+      );
+      return;
+    }
+
+    const settingsToSave = {
       shopName: cleanedName,
       currencyCode,
-    });
+    };
+    const saveResult = saveShopSettings(
+      settingsToSave,
+      savedSnapshot.raw,
+      savedSnapshot.status === "invalid" && currencyExplicitlySelected
+    );
 
+    if (saveResult === "conflict") {
+      const latest = getShopSettingsSnapshot();
+
+      setSavedSnapshot(latest);
+      setHasUnsavedChanges(false);
+
+      if (latest.status === "valid" || latest.status === "missing") {
+        setShopName(latest.settings.shopName);
+        setCurrencyCode(latest.settings.currencyCode);
+        setCurrencyExplicitlySelected(false);
+        setNotice(
+          "Settings changed in another tab. The latest saved values were loaded; review them and save again if needed."
+        );
+      } else {
+        setShopName(getRecoverableShopName(latest));
+        setCurrencyCode("");
+        setCurrencyExplicitlySelected(false);
+        setNotice(
+          `${latest.message} The latest settings could not be loaded, and no settings were overwritten. Repair the saved value before trying again.`
+        );
+      }
+      return;
+    }
+
+    if (saveResult === "invalid") {
+      const latest = getShopSettingsSnapshot();
+      setSavedSnapshot(latest);
+      setHasUnsavedChanges(false);
+      if (latest.status === "invalid") {
+        setShopName(getRecoverableShopName(latest));
+        setCurrencyCode("");
+      }
+      setCurrencyExplicitlySelected(false);
+      setNotice(
+        latest.status === "invalid"
+          ? `${latest.message} No changes were made.`
+          : "Saved settings are invalid. No changes were made; reload and review Workspace settings."
+      );
+      return;
+    }
+
+    if (saveResult === "error") {
+      setNotice("Could not save shop settings. Check available browser storage.");
+      return;
+    }
+
+    const storedFields = {
+      ...(savedSnapshot.status === "valid" || savedSnapshot.status === "invalid"
+        ? savedSnapshot.storedFields ?? {}
+        : {}),
+      ...settingsToSave,
+    };
+
+    setSavedSnapshot({
+      status: "valid",
+      raw: JSON.stringify(storedFields),
+      settings: settingsToSave,
+      storedFields,
+    });
+    setHasUnsavedChanges(false);
+    setCurrencyExplicitlySelected(false);
     setShopName(cleanedName);
     setNotice("Shop settings saved successfully.");
   };
@@ -97,7 +288,8 @@ export default function Settings() {
                   value={shopName}
                   onChange={(event) => {
                     setShopName(event.target.value);
-                    setNotice("");
+                    setHasUnsavedChanges(true);
+                    setNotice(getSettingsEditNotice());
                   }}
                   placeholder="Enter your shop name"
                   maxLength={80}
@@ -116,7 +308,7 @@ export default function Settings() {
                   value={currencySearch}
                   onChange={(event) => {
                     setCurrencySearch(event.target.value);
-                    setNotice("");
+                    setNotice(getSettingsEditNotice());
                   }}
                   placeholder="Search by code, e.g. AED or CNY"
                 />
@@ -130,11 +322,18 @@ export default function Settings() {
                 value={currencyCode}
                 onChange={(event) => {
                   setCurrencyCode(event.target.value);
-                  setNotice("");
+                  setCurrencyExplicitlySelected(true);
+                  setHasUnsavedChanges(true);
+                  setNotice(getSettingsEditNotice(true));
                 }}
               >
+                {filteredCurrencies.length > 0 && currencyCode === "" && (
+                  <option value="" disabled>
+                    Select a currency to repair settings
+                  </option>
+                )}
                 {filteredCurrencies.length === 0 ? (
-                  <option value={currencyCode}>
+                  <option value={currencyCode} disabled>
                     No matching currencies
                   </option>
                 ) : (

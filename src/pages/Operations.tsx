@@ -26,17 +26,28 @@ import {
 import type { PageKey } from "../components/Sidebar";
 import {
   convertToSnapshotCurrency,
+  DEFAULT_SETTINGS,
+  EXCHANGE_RATES_STORAGE_KEY,
   formatCurrency,
-  getRecordCurrency,
+  getKnownCostAmount,
+  getKnownRecordCurrency,
+  getKnownSaleAmount,
+  getKnownStockQuantity,
   getSavedExchangeRateSnapshot,
   getShopCurrency,
+  isExchangeRateSnapshotExpired,
   refreshExchangeRateSnapshot,
+  SETTINGS_STORAGE_KEY,
 } from "../utils/currency";
 
 import type {
   CurrencyCode,
   ExchangeRateSnapshot,
 } from "../utils/currency";
+import {
+  getKnownPaymentMethod,
+  type PaymentMethod,
+} from "../utils/sales";
 
 type OperationRecord = {
   id: number;
@@ -58,12 +69,6 @@ type InventoryRecord = {
   currencyCode?: CurrencyCode;
 };
 
-type PaymentMethod =
-  | "Cash"
-  | "MTN Mobile Money"
-  | "Airtel Money"
-  | "Bank Transfer";
-
 type SaleRecord = {
   id: string;
   deviceId: string;
@@ -72,7 +77,7 @@ type SaleRecord = {
   salePrice: number;
   paymentMethod: PaymentMethod;
   transactionDate: string;
-  costPrice: number;
+  costPrice?: number | null;
   category?: "Device" | "Accessory / spare part";
   quantitySold?: number;
   unitPrice?: number;
@@ -83,31 +88,42 @@ type SaleRecord = {
 const INVENTORY_KEY = "stockpilot-inventory";
 const SALES_KEY = "stockpilot-sales";
 
-function readStorage<T>(key: string): T[] {
+type StoredArrayReadState<T> = {
+  records: T[];
+  hasValidSnapshot: boolean;
+  readError: boolean;
+};
+
+function readStorage<T>(key: string): T[] | null {
   try {
     const saved = localStorage.getItem(key);
-    if (!saved) return [];
+    if (saved === null) return [];
 
     const parsed: unknown = JSON.parse(saved);
-    return Array.isArray(parsed) ? (parsed as T[]) : [];
+    return Array.isArray(parsed) ? (parsed as T[]) : null;
   } catch {
-    return [];
+    return null;
   }
+}
+
+function toStoredArrayReadState<T>(records: T[] | null): StoredArrayReadState<T> {
+  return {
+    records: records ?? [],
+    hasValidSnapshot: records !== null,
+    readError: records === null,
+  };
 }
 
 function formatMoney(
   amount: number,
-  currencyCode: CurrencyCode = getShopCurrency()
+  currencyCode: CurrencyCode | null
 ) {
-  return formatCurrency(
-    Number.isFinite(amount) ? amount : 0,
-    currencyCode
-  );
+  return formatCurrency(amount, currencyCode);
 }
 
 function convertReportAmount(
   amount: number,
-  sourceCurrency: CurrencyCode | undefined,
+  sourceCurrency: string | null | undefined,
   targetCurrency: CurrencyCode,
   snapshot: ExchangeRateSnapshot | null
 ): number | null {
@@ -115,7 +131,8 @@ function convertReportAmount(
 
   if (!Number.isFinite(safeAmount)) return null;
 
-  const sourceCode = getRecordCurrency(sourceCurrency);
+  const sourceCode = getKnownRecordCurrency(sourceCurrency);
+  if (!sourceCode) return null;
 
   if (sourceCode === targetCurrency) {
     return safeAmount;
@@ -141,7 +158,7 @@ function getSaleCategory(sale: SaleRecord) {
 function getSaleQuantity(sale: SaleRecord) {
   return getSaleCategory(sale) === "Device"
     ? 1
-    : Math.max(0, Number(sale.quantitySold) || 0);
+    : getKnownStockQuantity(sale.quantitySold);
 }
 
 function getLocalDateKey(date: Date) {
@@ -152,42 +169,124 @@ function getLocalDateKey(date: Date) {
 }
 
 function ReportsView() {
-  const [inventory, setInventory] = useState<InventoryRecord[]>(() =>
-    readStorage<InventoryRecord>(INVENTORY_KEY)
+  const [inventoryReadState, setInventoryReadState] = useState(() =>
+    toStoredArrayReadState(readStorage<InventoryRecord>(INVENTORY_KEY))
   );
+  const inventory = inventoryReadState.records;
 
-  const [sales, setSales] = useState<SaleRecord[]>(() =>
-    readStorage<SaleRecord>(SALES_KEY)
+  const [salesReadState, setSalesReadState] = useState(() =>
+    toStoredArrayReadState(readStorage<SaleRecord>(SALES_KEY))
   );
+  const sales = salesReadState.records;
 
   const [period, setPeriod] = useState<"7" | "30" | "all">("7");
 
-  const [shopCurrency] = useState<CurrencyCode>(() =>
-    getShopCurrency()
+  const [shopCurrency, setShopCurrency] = useState<CurrencyCode>(
+    () => getShopCurrency() ?? DEFAULT_SETTINGS.currencyCode
+  );
+  const [currencySettingsInvalid, setCurrencySettingsInvalid] = useState(
+    () => getShopCurrency() === null
   );
 
   const [rateSnapshot, setRateSnapshot] =
     useState<ExchangeRateSnapshot | null>(() =>
-      getSavedExchangeRateSnapshot(getShopCurrency())
+      getSavedExchangeRateSnapshot(
+        getShopCurrency() ?? DEFAULT_SETTINGS.currencyCode
+      )
     );
+  const [rateNotice, setRateNotice] = useState("");
 
   useEffect(() => {
-    const refreshData = () => {
-      setInventory(readStorage<InventoryRecord>(INVENTORY_KEY));
-      setSales(readStorage<SaleRecord>(SALES_KEY));
-    };
+    const refreshData = (event?: StorageEvent) => {
+      if (
+        event &&
+        event.key !== INVENTORY_KEY &&
+        event.key !== SALES_KEY &&
+        event.key !== SETTINGS_STORAGE_KEY &&
+        event.key !== EXCHANGE_RATES_STORAGE_KEY &&
+        event.key !== null
+      ) {
+        return;
+      }
 
-    window.addEventListener("focus", refreshData);
+      if (!event || event.key === INVENTORY_KEY || event.key === null) {
+        const latestInventory = readStorage<InventoryRecord>(INVENTORY_KEY);
+        setInventoryReadState((current) =>
+          latestInventory === null
+            ? { ...current, readError: true }
+            : {
+                records: latestInventory,
+                hasValidSnapshot: true,
+                readError: false,
+              }
+        );
+      }
+      if (!event || event.key === SALES_KEY || event.key === null) {
+        const latestSales = readStorage<SaleRecord>(SALES_KEY);
+        setSalesReadState((current) =>
+          latestSales === null
+            ? { ...current, readError: true }
+            : {
+                records: latestSales,
+                hasValidSnapshot: true,
+                readError: false,
+              }
+        );
+      }
+      if (
+        !event ||
+        event.key === SETTINGS_STORAGE_KEY ||
+        event.key === null
+      ) {
+        const currentShopCurrency = getShopCurrency();
+        setCurrencySettingsInvalid(currentShopCurrency === null);
+        setShopCurrency(
+          currentShopCurrency ?? DEFAULT_SETTINGS.currencyCode
+        );
+      }
+      if (
+        !event ||
+        event.key === EXCHANGE_RATES_STORAGE_KEY ||
+        event.key === SETTINGS_STORAGE_KEY ||
+        event.key === null
+      ) {
+        const currentShopCurrency =
+          getShopCurrency() ?? DEFAULT_SETTINGS.currencyCode;
+        const latestSnapshot =
+          getSavedExchangeRateSnapshot(currentShopCurrency);
+        setRateSnapshot((current) =>
+          JSON.stringify(current) === JSON.stringify(latestSnapshot)
+            ? current
+            : latestSnapshot
+        );
+      }
+    };
+    const refreshOnFocus = () => refreshData();
+
+    window.addEventListener("focus", refreshOnFocus);
     window.addEventListener("storage", refreshData);
 
     return () => {
-      window.removeEventListener("focus", refreshData);
+      window.removeEventListener("focus", refreshOnFocus);
       window.removeEventListener("storage", refreshData);
     };
-  }, []);
+  }, [shopCurrency]);
+
+  const hasInventorySnapshot = inventoryReadState.hasValidSnapshot;
+  const hasSalesSnapshot = salesReadState.hasValidSnapshot;
 
   useEffect(() => {
     let active = true;
+
+    if (currencySettingsInvalid) {
+      setRateSnapshot(null);
+      setRateNotice(
+        "Shop currency settings are unavailable. Financial totals that require a shop-currency basis cannot be calculated."
+      );
+      return () => {
+        active = false;
+      };
+    }
 
     const savedSnapshot =
       getSavedExchangeRateSnapshot(shopCurrency);
@@ -200,12 +299,25 @@ function ReportsView() {
       .then((snapshot) => {
         if (active) {
           setRateSnapshot(snapshot);
+          setRateNotice("");
         }
       })
-      .catch(() => {
+      .catch((error: unknown) => {
+        console.error("Could not refresh Operations exchange rates:", error);
         if (active) {
-          setRateSnapshot(
-            getSavedExchangeRateSnapshot(shopCurrency)
+          const fallbackSnapshot =
+            getSavedExchangeRateSnapshot(shopCurrency);
+          setRateSnapshot(fallbackSnapshot);
+          setRateNotice(
+            fallbackSnapshot
+              ? `Live exchange rates could not be refreshed. Using the saved snapshot last updated ${new Date(
+                  fallbackSnapshot.lastUpdatedAt
+                ).toLocaleString()}${
+                  isExchangeRateSnapshotExpired(fallbackSnapshot)
+                    ? " (expired)."
+                    : "."
+                }`
+              : "Exchange rates are unavailable. Records in other currencies are excluded from converted totals."
           );
         }
       });
@@ -213,7 +325,7 @@ function ReportsView() {
     return () => {
       active = false;
     };
-  }, [shopCurrency]);
+  }, [shopCurrency, currencySettingsInvalid]);
 
   const filteredSales = useMemo(() => {
     const now = new Date();
@@ -240,6 +352,19 @@ function ReportsView() {
     let costOfGoods = 0;
     let unconvertedRevenue = 0;
     let unconvertedCosts = 0;
+    let unknownCurrencyRevenue = 0;
+    let unknownCurrencyCosts = 0;
+    let unknownCostAmounts = 0;
+    let invalidSaleAmounts = 0;
+    let invalidSaleQuantities = 0;
+    let invalidSaleQuantityTotals = 0;
+    let saleQuantityTotalInvalidated = false;
+    let unknownPaymentMethods = 0;
+    let invalidTotalCalculations = 0;
+    let revenueTotalInvalidated = false;
+    let costTotalInvalidated = false;
+    let unavailableRateRevenue = 0;
+    let unavailableRateCosts = 0;
 
     const paymentTotals: Record<string, number> = {};
     const categoryTotals = {
@@ -258,49 +383,133 @@ function ReportsView() {
     let accessoryUnits = 0;
 
     filteredSales.forEach((sale) => {
-      const saleAmount = convertReportAmount(
-        sale.salePrice,
-        sale.currencyCode,
-        shopCurrency,
-        rateSnapshot
-      );
+      const knownSaleAmount = getKnownSaleAmount(sale.salePrice);
+      if (knownSaleAmount === null) invalidSaleAmounts += 1;
+      const method = getKnownPaymentMethod(sale.paymentMethod);
+      if (!method) unknownPaymentMethods += 1;
+
+      const saleCurrency = getKnownRecordCurrency(sale.currencyCode);
+      if (!saleCurrency) unknownCurrencyRevenue += 1;
+
+      const saleAmount =
+        knownSaleAmount === null
+          ? null
+          : convertReportAmount(
+              knownSaleAmount,
+              saleCurrency,
+              shopCurrency,
+              rateSnapshot
+            );
 
       if (saleAmount === null) {
         unconvertedRevenue += 1;
-      } else {
-        revenue += saleAmount;
-
-        if (getSaleCategory(sale) === "Device") {
-          categoryTotals.devices += saleAmount;
-        } else {
-          categoryTotals.accessories += saleAmount;
+        if (
+          knownSaleAmount !== null &&
+          saleCurrency &&
+          saleCurrency !== shopCurrency
+        ) {
+          unavailableRateRevenue += 1;
         }
+      } else {
+        const nextRevenue = revenue + saleAmount;
+        const nextCategory =
+          getSaleCategory(sale) === "Device"
+              ? categoryTotals.devices + saleAmount
+              : categoryTotals.accessories + saleAmount;
+        const nextPaymentTotal = method
+          ? (paymentTotals[method] || 0) + saleAmount
+          : 0;
 
-        const method = sale.paymentMethod || "Other";
-        paymentTotals[method] =
-          (paymentTotals[method] || 0) + saleAmount;
+        if (
+          !Number.isFinite(nextRevenue) ||
+          !Number.isFinite(nextCategory) ||
+          !Number.isFinite(nextPaymentTotal)
+        ) {
+          revenue = Number.NaN;
+          if (getSaleCategory(sale) === "Device") {
+              categoryTotals.devices = Number.NaN;
+          } else {
+              categoryTotals.accessories = Number.NaN;
+          }
+          if (method) paymentTotals[method] = Number.NaN;
+          if (!revenueTotalInvalidated) {
+              invalidTotalCalculations += 1;
+              revenueTotalInvalidated = true;
+          }
+        } else {
+          revenue = nextRevenue;
+          if (getSaleCategory(sale) === "Device") {
+              categoryTotals.devices = nextCategory;
+          } else {
+              categoryTotals.accessories = nextCategory;
+          }
+          if (method) paymentTotals[method] = nextPaymentTotal;
+        }
       }
 
-      const costAmount = convertReportAmount(
-        sale.costPrice,
-        sale.costCurrencyCode ?? sale.currencyCode,
-        shopCurrency,
-        rateSnapshot
+      const saleCostCurrency = getKnownRecordCurrency(
+        sale.costCurrencyCode
       );
+      if (!saleCostCurrency) unknownCurrencyCosts += 1;
+
+      const saleCostAmount = getKnownCostAmount(sale.costPrice);
+      if (saleCostAmount === null) unknownCostAmounts += 1;
+
+      const costAmount =
+        saleCostAmount === null
+          ? null
+          : convertReportAmount(
+              saleCostAmount,
+              saleCostCurrency,
+              shopCurrency,
+              rateSnapshot
+            );
 
       if (costAmount === null) {
         unconvertedCosts += 1;
+        if (
+          saleCostAmount !== null &&
+          saleCostCurrency &&
+          saleCostCurrency !== shopCurrency
+        ) {
+          unavailableRateCosts += 1;
+        }
       } else {
-        costOfGoods += costAmount;
+        const updatedCostOfGoods = costOfGoods + costAmount;
+        if (Number.isFinite(updatedCostOfGoods)) {
+          costOfGoods = updatedCostOfGoods;
+        } else {
+          costOfGoods = Number.NaN;
+          if (!costTotalInvalidated) {
+            invalidTotalCalculations += 1;
+            costTotalInvalidated = true;
+          }
+        }
       }
 
       if (getSaleCategory(sale) === "Accessory / spare part") {
-        accessoryUnits += getSaleQuantity(sale);
+        const quantity = getSaleQuantity(sale);
+        if (quantity === null) {
+          invalidSaleQuantities += 1;
+        } else {
+          const updatedUnits = accessoryUnits + quantity;
+          if (Number.isSafeInteger(updatedUnits)) {
+            accessoryUnits = updatedUnits;
+          } else {
+            accessoryUnits = Number.NaN;
+            if (!saleQuantityTotalInvalidated) {
+              invalidSaleQuantityTotals += 1;
+              saleQuantityTotalInvalidated = true;
+            }
+          }
+        }
       }
     });
 
     const grossProfit =
-      unconvertedRevenue > 0 || unconvertedCosts > 0
+      unconvertedRevenue > 0 ||
+      unconvertedCosts > 0 ||
+      invalidTotalCalculations > 0
         ? null
         : revenue - costOfGoods;
 
@@ -310,6 +519,16 @@ function ReportsView() {
       grossProfit,
       unconvertedRevenue,
       unconvertedCosts,
+      unknownCurrencyRevenue,
+      unknownCurrencyCosts,
+      unknownCostAmounts,
+      invalidSaleAmounts,
+      invalidSaleQuantities,
+      invalidSaleQuantityTotals,
+      unknownPaymentMethods,
+      invalidTotalCalculations,
+      unavailableRateRevenue,
+      unavailableRateCosts,
       categoryTotals,
       transactionCount: filteredSales.length,
       deviceCount: deviceSales.length,
@@ -334,35 +553,76 @@ function ReportsView() {
       (item) => item.category === "Accessory / spare part"
     );
 
-    const accessoryUnits = accessories.reduce(
-      (total, item) =>
-        total + Math.max(0, Number(item.quantity) || 0),
-      0
-    );
+    let unknownQuantityValuation = 0;
+    let invalidStockQuantityTotals = 0;
+    let stockQuantityTotalInvalidated = false;
+    const accessoryUnits = accessories.reduce((total, item) => {
+      const quantity = getKnownStockQuantity(item.quantity);
+      if (quantity === null) {
+        unknownQuantityValuation += 1;
+        return total;
+      }
+      const updated = total + quantity;
+      if (Number.isSafeInteger(updated)) return updated;
+      if (!stockQuantityTotalInvalidated) {
+        invalidStockQuantityTotals += 1;
+        stockQuantityTotalInvalidated = true;
+      }
+      return Number.NaN;
+    }, 0);
 
     let valuation = 0;
     let unconvertedValuation = 0;
+    let unknownCurrencyValuation = 0;
+    let unknownCostValuation = 0;
+    let unavailableRateValuation = 0;
+    let invalidValuationTotals = 0;
+    let valuationTotalInvalidated = false;
 
     available.forEach((item) => {
       const quantity =
         item.category === "Accessory / spare part"
-          ? Math.max(0, Number(item.quantity) || 0)
+          ? getKnownStockQuantity(item.quantity)
           : 1;
 
-      const originalCost =
-        (Number(item.costPrice) || 0) * quantity;
+      const costAmount = getKnownCostAmount(item.costPrice);
+      const sourceCurrency = getKnownRecordCurrency(item.currencyCode);
+      if (!sourceCurrency) unknownCurrencyValuation += 1;
+      if (costAmount === null) unknownCostValuation += 1;
+
+      if (costAmount === null || !sourceCurrency || quantity === null) {
+        unconvertedValuation += 1;
+        return;
+      }
+
+      const inventoryCost = costAmount * quantity;
+      if (!Number.isFinite(inventoryCost)) {
+        unconvertedValuation += 1;
+        return;
+      }
 
       const convertedCost = convertReportAmount(
-        originalCost,
-        item.currencyCode,
+        inventoryCost,
+        sourceCurrency,
         shopCurrency,
         rateSnapshot
       );
 
       if (convertedCost === null) {
         unconvertedValuation += 1;
+        unavailableRateValuation += 1;
       } else {
-        valuation += convertedCost;
+        const updated = valuation + convertedCost;
+        if (Number.isFinite(updated)) {
+          valuation = updated;
+        } else {
+          valuation = Number.NaN;
+          if (!valuationTotalInvalidated) {
+            unconvertedValuation += 1;
+            invalidValuationTotals += 1;
+            valuationTotalInvalidated = true;
+          }
+        }
       }
     });
 
@@ -373,6 +633,12 @@ function ReportsView() {
       totalUnits: devices.length + accessoryUnits,
       valuation,
       unconvertedValuation,
+      unknownCurrencyValuation,
+      unknownCostValuation,
+      unknownQuantityValuation,
+      unavailableRateValuation,
+      invalidValuationTotals,
+      invalidStockQuantityTotals,
       withMiddleMan: available.filter(
         (item) => item.status === "With middle-man"
       ).length,
@@ -407,17 +673,27 @@ function ReportsView() {
     let unconvertedCount = 0;
 
     daySales.forEach((sale) => {
-      const convertedAmount = convertReportAmount(
-        sale.salePrice,
-        sale.currencyCode,
-        shopCurrency,
-        rateSnapshot
-      );
+      const amount = getKnownSaleAmount(sale.salePrice);
+      const convertedAmount =
+        amount === null
+          ? null
+          : convertReportAmount(
+              amount,
+              sale.currencyCode,
+              shopCurrency,
+              rateSnapshot
+            );
 
       if (convertedAmount === null) {
         unconvertedCount += 1;
       } else {
-        total += convertedAmount;
+        const updated = total + convertedAmount;
+        if (Number.isFinite(updated)) {
+          total = updated;
+        } else {
+          total = Number.NaN;
+          unconvertedCount += 1;
+        }
       }
     });
 
@@ -434,7 +710,9 @@ function ReportsView() {
 }, [filteredSales, period, shopCurrency, rateSnapshot]);
 
   const highestDailySale = Math.max(
-    ...dailySales.map((day) => day.total),
+    ...dailySales.map((day) =>
+      Number.isFinite(day.total) ? day.total : 0
+    ),
     1
   );
 
@@ -452,6 +730,9 @@ function ReportsView() {
       : period === "30"
         ? "Last 30 days"
         : "All recorded time";
+  const invalidDateSalesCount = sales.filter((sale) =>
+    Number.isNaN(new Date(sale.transactionDate).getTime())
+  ).length;
 
   return (
     <section className="operations-page page-content">
@@ -471,6 +752,40 @@ function ReportsView() {
           <BarChart3 size={22} />
         </div>
       </div>
+
+      {(inventoryReadState.readError || salesReadState.readError) && (
+        <div className="operations-note" role="alert">
+          <strong>Some browser data could not be read.</strong>{" "}
+          {inventoryReadState.readError && (
+            <span>
+              {hasInventorySnapshot
+                ? "The latest inventory read failed; showing the last successfully loaded inventory, so its figures may be out of date. "
+                : "Inventory data is unavailable. "}
+            </span>
+          )}
+          {salesReadState.readError && (
+            <span>
+              {hasSalesSnapshot
+                ? "The latest sales read failed; showing the last successfully loaded sales, so its figures may be out of date."
+                : "Sales data is unavailable."}
+            </span>
+          )}
+        </div>
+      )}
+
+      {currencySettingsInvalid && (
+        <div className="operations-note" role="status">
+          Shop currency settings are invalid or unavailable. Report currency
+          totals use {shopCurrency} as the configured default conversion basis;
+          this may not match the shop's intended currency.
+        </div>
+      )}
+
+      {rateNotice && (
+        <div className="operations-note" role="status">
+          {rateNotice}
+        </div>
+      )}
 
       <div className="operations-report-toolbar">
         <div>
@@ -506,8 +821,19 @@ function ReportsView() {
             <Banknote size={19} />
           </div>
           <span>Sales revenue</span>
-          <strong>{formatMoney(report.revenue, shopCurrency)}</strong>
-          <small>{report.transactionCount} transactions</small>
+          <strong>
+            {hasSalesSnapshot && !currencySettingsInvalid
+              ? formatMoney(report.revenue, shopCurrency)
+              : "Unavailable"}
+          </strong>
+          <small>
+            {hasSalesSnapshot
+              ? `${report.transactionCount} transactions`
+              : "Sales data is unavailable."}
+            {hasSalesSnapshot && report.unconvertedRevenue > 0
+              ? " · " + report.unconvertedRevenue + " excluded/unconverted"
+              : ""}
+          </small>
         </article>
 
         <article className="surface-card operations-stat">
@@ -520,11 +846,16 @@ function ReportsView() {
               ? "report-negative"
               : ""
            }>
-            {report.grossProfit === null
+            {!hasSalesSnapshot || currencySettingsInvalid
+            ? "Unavailable"
+            : report.grossProfit === null
             ? "Unavailable"
             : formatMoney(report.grossProfit, shopCurrency)}
           </strong>
-          <small>Revenue minus recorded cost</small>
+          <small>
+            Unavailable while selected revenue or cost records cannot be
+            converted reliably.
+          </small>
         </article>
 
         <article className="surface-card operations-stat">
@@ -532,8 +863,19 @@ function ReportsView() {
             <Wallet size={19} />
           </div>
           <span>Cost of goods sold</span>
-          <strong>{formatMoney(report.costOfGoods, shopCurrency)}</strong>
-          <small>Cost attached to recorded sales</small>
+          <strong>
+            {hasSalesSnapshot && !currencySettingsInvalid
+              ? formatMoney(report.costOfGoods, shopCurrency)
+              : "Unavailable"}
+          </strong>
+          <small>
+            {hasSalesSnapshot
+              ? "Cost attached to recorded sales"
+              : "Sales data is unavailable."}
+            {hasSalesSnapshot && report.unconvertedCosts > 0
+              ? " · " + report.unconvertedCosts + " excluded/unconverted"
+              : ""}
+          </small>
         </article>
 
         <article className="surface-card operations-stat">
@@ -541,10 +883,146 @@ function ReportsView() {
             <Package size={19} />
           </div>
           <span>Current stock value</span>
-          <strong>{formatMoney(stock.valuation, shopCurrency)}</strong>
-          <small>{stock.totalUnits} units still in stock</small>
+          <strong>
+            {hasInventorySnapshot && !currencySettingsInvalid
+              ? formatMoney(stock.valuation, shopCurrency)
+              : "Unavailable"}
+          </strong>
+          <small>
+            {hasInventorySnapshot
+              ? Number.isFinite(stock.totalUnits)
+                ? `${stock.totalUnits} units still in stock`
+                : "Stock unit total unavailable"
+              : "Inventory data is unavailable."}
+            {hasInventorySnapshot && stock.unconvertedValuation > 0
+              ? " · " +
+                stock.unconvertedValuation +
+                " valuation record(s) excluded/unconverted"
+              : ""}
+          </small>
         </article>
       </div>
+
+      {((hasSalesSnapshot &&
+        (report.unconvertedRevenue > 0 ||
+          report.unconvertedCosts > 0 ||
+          report.invalidSaleQuantities > 0 ||
+          report.invalidSaleQuantityTotals > 0 ||
+          report.invalidTotalCalculations > 0 ||
+          report.unknownPaymentMethods > 0 ||
+          invalidDateSalesCount > 0)) ||
+        (hasInventorySnapshot && stock.unconvertedValuation > 0)) && (
+        <div className="operations-note" role="status">
+          <strong>These reports are incomplete.</strong>{" "}
+          {hasSalesSnapshot && report.unknownCurrencyRevenue > 0 && (
+            <span>
+              {report.unknownCurrencyRevenue} sale(s) with unavailable
+              currency were excluded from revenue.
+            </span>
+          )}{" "}
+          {hasSalesSnapshot && report.unknownCurrencyCosts > 0 && (
+            <span>
+              {report.unknownCurrencyCosts} sale cost(s) with unavailable
+              currency were excluded from cost of goods and gross profit.
+            </span>
+          )}{" "}
+          {hasSalesSnapshot && report.unknownCostAmounts > 0 && (
+            <span>
+              {report.unknownCostAmounts} sale(s) with unavailable cost amounts
+              were excluded from cost of goods and gross profit.
+            </span>
+          )}{" "}
+          {hasSalesSnapshot && report.invalidSaleAmounts > 0 && (
+            <span>
+              {report.invalidSaleAmounts} sale(s) with invalid, negative, or
+              non-finite amounts were excluded from revenue; gross profit is
+              unavailable.
+            </span>
+          )}{" "}
+          {hasSalesSnapshot && report.invalidSaleQuantities > 0 && (
+            <span>
+              {report.invalidSaleQuantities} accessory sale(s) have invalid
+              quantities and were excluded from unit counts.
+            </span>
+          )}{" "}
+          {hasSalesSnapshot && report.invalidSaleQuantityTotals > 0 && (
+            <span>
+              Accessory sale-unit totals exceeded the supported numeric range
+              and are unavailable.
+            </span>
+          )}{" "}
+          {hasSalesSnapshot && report.invalidTotalCalculations > 0 && (
+            <span>
+              {report.invalidTotalCalculations} financial total calculation(s)
+              exceeded the supported numeric range.
+            </span>
+          )}{" "}
+          {hasSalesSnapshot && report.unknownPaymentMethods > 0 && (
+            <span>
+              {report.unknownPaymentMethods} sale(s) have an unsupported or
+              missing payment method; they are excluded from the payment
+              method breakdown.
+            </span>
+          )}{" "}
+          {hasSalesSnapshot && report.unavailableRateRevenue > 0 && (
+            <span>
+              {report.unavailableRateRevenue} sale(s) were not converted because
+              an exchange rate is unavailable.
+            </span>
+          )}{" "}
+          {hasSalesSnapshot && report.unavailableRateCosts > 0 && (
+            <span>
+              {report.unavailableRateCosts} sale cost(s) were not converted
+              because an exchange rate is unavailable.
+            </span>
+          )}{" "}
+          {hasSalesSnapshot && invalidDateSalesCount > 0 && (
+            <span>
+              {invalidDateSalesCount} sale(s) with invalid dates cannot be
+              assigned to a reporting period.
+            </span>
+          )}{" "}
+          {hasInventorySnapshot && stock.unknownCurrencyValuation > 0 && (
+            <span>
+              {stock.unknownCurrencyValuation} inventory valuation record(s)
+              with unavailable currency were excluded.
+            </span>
+          )}{" "}
+          {hasInventorySnapshot && stock.unknownCostValuation > 0 && (
+            <span>
+              {stock.unknownCostValuation} inventory valuation record(s) with
+              unavailable cost amounts were excluded.
+            </span>
+          )}{" "}
+          {hasInventorySnapshot && stock.unknownQuantityValuation > 0 && (
+            <span>
+              {stock.unknownQuantityValuation} accessory record(s) with invalid
+              quantities were excluded from stock counts and valuation.
+            </span>
+          )}{" "}
+          {hasInventorySnapshot && stock.unavailableRateValuation > 0 && (
+            <span>
+              {stock.unavailableRateValuation} inventory valuation record(s)
+              could not be converted because an exchange rate is unavailable.
+            </span>
+          )}{" "}
+          {hasInventorySnapshot && stock.invalidValuationTotals > 0 && (
+            <span>
+              Inventory valuation total exceeded the supported numeric range.
+            </span>
+          )}{" "}
+          {hasInventorySnapshot && stock.invalidStockQuantityTotals > 0 && (
+            <span>
+              Accessory unit total exceeded the supported numeric range.
+            </span>
+          )}{" "}
+          Some records may be excluded because amounts, currencies,
+          quantities, or exchange rates are invalid or unavailable. Gross
+          profit is not shown when revenue or costs cannot be converted
+          reliably. Issue categories can overlap; each record is excluded only
+          once from a particular subtotal.
+        </div>
+      )}
 
       <div className="operations-report-grid">
         <section className="surface-card operations-report-card">
@@ -556,7 +1034,17 @@ function ReportsView() {
             <CalendarClock size={19} />
           </div>
 
-          {report.transactionCount === 0 ? (
+          {!hasSalesSnapshot || currencySettingsInvalid ? (
+            <div className="inventory-empty">
+              <BarChart3 size={25} />
+              <strong>Sales report unavailable</strong>
+              <span>
+                {!hasSalesSnapshot
+                  ? "Browser sales data could not be read."
+                  : "Shop currency settings are invalid or unavailable."}
+              </span>
+            </div>
+          ) : report.transactionCount === 0 ? (
             <div className="inventory-empty">
               <BarChart3 size={25} />
               <strong>No sales in this period</strong>
@@ -571,7 +1059,11 @@ function ReportsView() {
                     <div
                       className="operations-report-bar-fill"
                       style={{
-                        width: `${(day.total / highestDailySale) * 100}%`,
+                        width: `${
+                          Number.isFinite(day.total)
+                            ? (day.total / highestDailySale) * 100
+                            : 0
+                        }%`,
                       }}
                     />
                   </div>
@@ -591,6 +1083,10 @@ function ReportsView() {
     <ShoppingCart size={19} />
   </div>
 
+  {!hasSalesSnapshot || currencySettingsInvalid ? (
+    <p className="operations-report-empty">Sales report unavailable.</p>
+  ) : (
+  <>
   <div className="operations-report-breakdown">
     <div className="operations-report-breakdown-row">
       <div className="operations-report-breakdown-icon">
@@ -603,7 +1099,9 @@ function ReportsView() {
       </div>
 
       <strong>
-        {formatMoney(report.categoryTotals.devices, shopCurrency)}
+        {currencySettingsInvalid
+          ? "Unavailable"
+          : formatMoney(report.categoryTotals.devices, shopCurrency)}
       </strong>
     </div>
 
@@ -620,14 +1118,20 @@ function ReportsView() {
       </div>
 
       <strong>
-        {formatMoney(report.categoryTotals.accessories, shopCurrency)}
+        {currencySettingsInvalid
+          ? "Unavailable"
+          : formatMoney(report.categoryTotals.accessories, shopCurrency)}
       </strong>
     </div>
   </div>
 
   <div className="operations-report-divider" />
 
-  <div className="card-kicker">PAYMENT METHODS</div>
+  <div className="card-kicker">RECORDED SALE VALUE BY PAYMENT METHOD</div>
+  <p className="operations-report-empty">
+    The selected payment method applies to the full sale amount. Partial
+    customer payments are not supported.
+  </p>
 
   {Object.keys(report.paymentTotals).length === 0 ? (
     <p className="operations-report-empty">
@@ -638,10 +1142,16 @@ function ReportsView() {
       {Object.entries(report.paymentTotals).map(([method, total]) => (
         <div className="operations-report-payment" key={method}>
           <span>{method}</span>
-          <strong>{formatMoney(total, shopCurrency)}</strong>
+          <strong>
+            {currencySettingsInvalid
+              ? "Unavailable"
+              : formatMoney(total, shopCurrency)}
+          </strong>
         </div>
       ))}
     </div>
+  )}
+  </>
   )}
 </section>
       </div>
@@ -659,31 +1169,35 @@ function ReportsView() {
           <div>
             <Smartphone size={19} />
             <span>Devices in stock</span>
-            <strong>{stock.deviceCount}</strong>
+            <strong>{hasInventorySnapshot ? stock.deviceCount : "Unavailable"}</strong>
           </div>
 
           <div>
             <Package size={19} />
             <span>Accessory types</span>
-            <strong>{stock.accessoryTypes}</strong>
+            <strong>{hasInventorySnapshot ? stock.accessoryTypes : "Unavailable"}</strong>
           </div>
 
           <div>
             <ShoppingCart size={19} />
             <span>Accessory units</span>
-            <strong>{stock.accessoryUnits}</strong>
+            <strong>
+              {hasInventorySnapshot && Number.isFinite(stock.accessoryUnits)
+                ? stock.accessoryUnits
+                : "Unavailable"}
+            </strong>
           </div>
 
           <div>
             <ArrowLeftRight size={19} />
             <span>With middle-men</span>
-            <strong>{stock.withMiddleMan}</strong>
+            <strong>{hasInventorySnapshot ? stock.withMiddleMan : "Unavailable"}</strong>
           </div>
 
           <div>
             <Wrench size={19} />
             <span>At repairers</span>
-            <strong>{stock.atRepairer}</strong>
+            <strong>{hasInventorySnapshot ? stock.atRepairer : "Unavailable"}</strong>
           </div>
         </div>
 
@@ -701,21 +1215,36 @@ function ReportsView() {
     </div>
 
     <span className="inventory-count">
-      {filteredSales.length} transactions
+      {hasSalesSnapshot ? `${filteredSales.length} transactions` : "Unavailable"}
     </span>
   </div>
 
-  {recentSales.length === 0 ? (
+  {!hasSalesSnapshot ? (
     <div className="inventory-empty">
       <Receipt size={25} />
-      <strong>No transactions to display</strong>
-      <span>Record a sale to start building your reports.</span>
+      <strong>Sales records unavailable</strong>
+      <span>Browser sales data could not be read.</span>
+    </div>
+  ) : recentSales.length === 0 ? (
+    <div className="inventory-empty">
+      <Receipt size={25} />
+      <strong>
+        {salesReadState.readError
+          ? "No transactions in the last successful read"
+          : "No transactions to display"}
+      </strong>
+      <span>
+        {salesReadState.readError
+          ? "Current sales data could not be verified."
+          : "Record a sale to start building your reports."}
+      </span>
     </div>
   ) : (
     <div className="operations-record-list">
       {recentSales.map((sale) => {
         const accessory =
           getSaleCategory(sale) === "Accessory / spare part";
+        const saleQuantity = getSaleQuantity(sale);
 
         return (
           <article className="operations-record" key={sale.id}>
@@ -732,19 +1261,22 @@ function ReportsView() {
 
               <span>
                 {accessory
-                  ? `${getSaleQuantity(sale)} units`
+                  ? `${saleQuantity ?? "Unavailable"} units`
                   : sale.identifier || "Device sale"}
                 {" · "}
                 {new Date(sale.transactionDate).toLocaleString("en-UG")}
               </span>
 
-              <span>{sale.paymentMethod}</span>
+              <span>
+                {getKnownPaymentMethod(sale.paymentMethod) ??
+                  "Payment method unavailable"}
+              </span>
             </div>
 
             <strong className="operations-amount">
               {formatMoney(
-                Number(sale.salePrice) || 0,
-                getRecordCurrency(sale.currencyCode)
+                getKnownSaleAmount(sale.salePrice) ?? Number.NaN,
+                getKnownRecordCurrency(sale.currencyCode)
               )}
             </strong>
           </article>

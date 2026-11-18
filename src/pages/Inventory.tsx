@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ArrowDownToLine,
   ArrowUpFromLine,
@@ -13,6 +13,11 @@ import {
   XCircle,
 } from "lucide-react";
 import CameraScanner from "../components/CameraScanner";
+import {
+  getKnownCostAmount,
+  getKnownStockQuantity,
+  getShopCurrency,
+} from "../utils/currency";
 
 type Movement = "Receive stock" | "Record stock movement";
 type IdentifierField = "imei1" | "imei2" | "serial";
@@ -35,12 +40,25 @@ type DeviceRecord = {
   currencyCode?: string;
 };
 
-function readLatestInventory(): DeviceRecord[] | null {
-  try {
-    const saved = localStorage.getItem("stockpilot-inventory");
+type InventorySnapshot = {
+  raw: string | null;
+  records: DeviceRecord[];
+};
 
-    if (!saved) {
-      return [];
+type InventoryReadState = {
+  records: DeviceRecord[];
+  hasValidSnapshot: boolean;
+  readError: boolean;
+};
+
+const INVENTORY_KEY = "stockpilot-inventory";
+
+function readLatestInventory(): InventorySnapshot | null {
+  try {
+    const saved = localStorage.getItem(INVENTORY_KEY);
+
+    if (saved === null) {
+      return { raw: null, records: [] };
     }
 
     const parsed: unknown = JSON.parse(saved);
@@ -49,23 +67,37 @@ function readLatestInventory(): DeviceRecord[] | null {
       return null;
     }
 
-    return parsed as DeviceRecord[];
+    return { raw: saved, records: parsed as DeviceRecord[] };
   } catch (error) {
     console.error("Could not read latest inventory:", error);
     return null;
   }
 }
 
-function saveInventory(records: DeviceRecord[]): boolean {
+function toInventoryReadState(
+  snapshot: InventorySnapshot | null,
+): InventoryReadState {
+  return {
+    records: snapshot?.records ?? [],
+    hasValidSnapshot: snapshot !== null,
+    readError: snapshot === null,
+  };
+}
+
+function saveInventory(
+  records: DeviceRecord[],
+  expectedRaw: string | null,
+): "saved" | "conflict" | "error" {
   try {
-    localStorage.setItem(
-      "stockpilot-inventory",
-      JSON.stringify(records)
-    );
-    return true;
+    if (localStorage.getItem(INVENTORY_KEY) !== expectedRaw) {
+      return "conflict";
+    }
+
+    localStorage.setItem(INVENTORY_KEY, JSON.stringify(records));
+    return "saved";
   } catch (error) {
     console.error("Could not save inventory:", error);
-    return false;
+    return "error";
   }
 }
 
@@ -89,19 +121,42 @@ export default function Inventory() {
   const [status, setStatus] = useState("In shop");
   const [search, setSearch] = useState("");
   const [notice, setNotice] = useState("");
-  const [devices, setDevices] = useState<DeviceRecord[]>(() => {
-  try {
-    const savedDevices = localStorage.getItem("stockpilot-inventory");
+  const [inventoryReadState, setInventoryReadState] = useState(() =>
+    toInventoryReadState(readLatestInventory())
+  );
+  const devices = inventoryReadState.records;
 
-    if (savedDevices) {
-      return JSON.parse(savedDevices) as DeviceRecord[];
-    }
-  } catch (error) {
-    console.error("Could not load saved inventory:", error);
-  }
+  useEffect(() => {
+    const refreshInventory = (event?: StorageEvent) => {
+      if (event && event.key !== INVENTORY_KEY && event.key !== null) return;
 
-  return [];
-});
+      const latest = readLatestInventory();
+      setInventoryReadState((current) =>
+        latest
+          ? {
+              records:
+                JSON.stringify(current.records) ===
+                JSON.stringify(latest.records)
+                  ? current.records
+                  : latest.records,
+              hasValidSnapshot: true,
+              readError: false,
+            }
+          : current.readError
+            ? current
+            : { ...current, readError: true }
+      );
+    };
+    const refreshOnFocus = () => refreshInventory();
+
+    window.addEventListener("storage", refreshInventory);
+    window.addEventListener("focus", refreshOnFocus);
+
+    return () => {
+      window.removeEventListener("storage", refreshInventory);
+      window.removeEventListener("focus", refreshOnFocus);
+    };
+  }, []);
 
   const setIdentifier = useCallback((value: string) => {
     if (targetField === "imei1") setImei1(value);
@@ -109,9 +164,21 @@ export default function Inventory() {
     if (targetField === "serial") setSerial(value);
   }, [targetField]);
 
-  const filteredDevices = useMemo(() => devices.filter((device) =>
-    `${device.brand} ${device.model} ${device.identifier} ${device.status}`.toLowerCase().includes(search.toLowerCase())
-  ), [devices, search]);
+  const normalizedSearch = search.trim().toLowerCase();
+
+  const filteredDevices = useMemo(() => devices.filter((device) => {
+    const searchableValues = [
+      device.brand,
+      device.model,
+      device.identifier,
+      device.status,
+      ...(device.secondaryIdentifiers ?? []),
+    ];
+
+    return searchableValues.some((value) =>
+      String(value ?? "").toLowerCase().includes(normalizedSearch)
+    );
+  }), [devices, normalizedSearch]);
 
   const handleSave = () => {
     setNotice("");
@@ -123,14 +190,19 @@ export default function Inventory() {
       return;
     }
 
-    const latestDevices = readLatestInventory();
+    const inventorySnapshot = readLatestInventory();
 
-    if (!latestDevices) {
+    if (!inventorySnapshot) {
+      setInventoryReadState((current) =>
+        current.readError ? current : { ...current, readError: true }
+      );
       setNotice(
         "Could not read saved inventory. No changes were made. Please check your browser storage."
       );
       return;
     }
+
+    const latestDevices = inventorySnapshot.records;
 
     const identifier =
       imei1.trim() ||
@@ -173,10 +245,10 @@ export default function Inventory() {
       movement === "Receive stock" &&
       category === "Accessory / spare part"
     ) {
-      const quantityReceived = Number(quantity);
+      const quantityReceived = getKnownStockQuantity(Number(quantity));
 
       if (
-        !Number.isInteger(quantityReceived) ||
+        quantityReceived === null ||
         quantityReceived <= 0
       ) {
         setNotice("Enter a valid whole-number quantity.");
@@ -218,14 +290,34 @@ export default function Inventory() {
           : device
       );
 
-      if (!saveInventory(updatedDevices)) {
-        setNotice(
-          "Could not save the stock movement. No changes were made."
-        );
+      const saveResult = saveInventory(updatedDevices, inventorySnapshot.raw);
+
+      if (saveResult !== "saved") {
+        if (saveResult === "conflict") {
+          const latest = readLatestInventory();
+          setInventoryReadState((current) =>
+            latest
+              ? toInventoryReadState(latest)
+              : current.readError
+                ? current
+                : { ...current, readError: true }
+          );
+          setNotice(
+            "Inventory changed in another tab. The latest records were loaded; review and try again."
+          );
+        } else {
+          setNotice(
+            "Could not save the stock movement. No changes were made."
+          );
+        }
         return;
       }
 
-      setDevices(updatedDevices);
+      setInventoryReadState({
+        records: updatedDevices,
+        hasValidSnapshot: true,
+        readError: false,
+      });
       setNotice(
         `Stock movement recorded for ${matchedDevice.brand} ${matchedDevice.model}: ${status}.`
       );
@@ -243,6 +335,37 @@ export default function Inventory() {
       return;
     }
 
+    const normalizedCostPrice = costPrice.trim();
+    if (
+      normalizedCostPrice !== "" &&
+      getKnownCostAmount(normalizedCostPrice) === null
+    ) {
+      setNotice(
+        "Enter a valid non-negative cost, or leave the field blank if the cost is unknown."
+      );
+      return;
+    }
+
+    const normalizedSellingPrice = sellingPrice.trim();
+    if (
+      normalizedSellingPrice !== "" &&
+      getKnownCostAmount(normalizedSellingPrice) === null
+    ) {
+      setNotice(
+        "Enter a valid non-negative selling price, or leave the field blank if it is not known."
+      );
+      return;
+    }
+
+    const shopCurrency = getShopCurrency();
+
+    if (!shopCurrency) {
+      setNotice(
+        "Shop currency settings are invalid or unavailable. No inventory record was created; review Workspace settings first."
+      );
+      return;
+    }
+
     const record: DeviceRecord = {
       id: crypto.randomUUID(),
       brand: brand.trim() || "Unknown brand",
@@ -253,8 +376,8 @@ export default function Inventory() {
       storage: category === "Device" ? storage : undefined,
       networkStatus: category === "Device" ? networkStatus : undefined,
       condition,
-      costPrice: costPrice.trim() || undefined,
-      sellingPrice: sellingPrice.trim() || undefined,
+      costPrice: normalizedCostPrice || undefined,
+      sellingPrice: normalizedSellingPrice || undefined,
       category,
       quantity:
         category === "Accessory / spare part"
@@ -266,18 +389,39 @@ export default function Inventory() {
         serial.trim(),
       ].filter((value) => value && value !== identifier),
       updated: new Date().toISOString(),
+      currencyCode: shopCurrency,
     };
 
     const updatedDevices = [record, ...latestDevices];
 
-    if (!saveInventory(updatedDevices)) {
-      setNotice(
-        "Could not save the new inventory record. No changes were made."
-      );
+    const saveResult = saveInventory(updatedDevices, inventorySnapshot.raw);
+
+    if (saveResult !== "saved") {
+      if (saveResult === "conflict") {
+        const latest = readLatestInventory();
+        setInventoryReadState((current) =>
+          latest
+            ? toInventoryReadState(latest)
+            : current.readError
+              ? current
+              : { ...current, readError: true }
+        );
+        setNotice(
+          "Inventory changed in another tab. The latest records were loaded; review and try again."
+        );
+      } else {
+        setNotice(
+          "Could not save the new inventory record. No changes were made."
+        );
+      }
       return;
     }
 
-    setDevices(updatedDevices);
+    setInventoryReadState({
+      records: updatedDevices,
+      hasValidSnapshot: true,
+      readError: false,
+    });
     setNotice("Item added to inventory successfully.");
 
     setBrand("Apple");
@@ -303,8 +447,17 @@ export default function Inventory() {
           <h1>Device inventory</h1>
           <p className="page-subtitle">Receive, identify and track individual devices from one place.</p>
         </div>
-        <div className="inventory-status-chip"><span /> Demo workspace · sample data only</div>
+        <div className="inventory-status-chip"><span /> Browser storage · no cloud sync</div>
       </div>
+
+      {inventoryReadState.readError && (
+        <div className="inventory-notice notice-warning" role="alert">
+          <XCircle size={16} />
+          {inventoryReadState.hasValidSnapshot
+            ? "Could not refresh inventory. Showing the last successfully loaded records; current data may be out of date."
+            : "Inventory data is unavailable because browser storage could not be read. Counts and records cannot be verified."}
+        </div>
+      )}
 
       <div className="inventory-info-banner surface-card">
         <div className="inventory-info-icon"><ShieldCheck size={19} /></div>
@@ -341,7 +494,7 @@ export default function Inventory() {
 
             {movement === "Record stock movement" && <>
               <label className="inventory-field inventory-field-wide"><span>Movement type</span><select value={status} onChange={(event) => setStatus(event.target.value)}><option value="With middle-man">Handed to middle-man</option><option value="At repairer">Sent to repairer</option><option value="In shop">Returned to shop</option></select></label>
-              <p className="field-hint inventory-field-wide" role="note">Customer sales must be completed through Sales/POS so the sale transaction and inventory update are recorded together.</p>
+              <p className="field-hint inventory-field-wide" role="note">Customer sales must be completed through Sales/POS, which records the sale and updates inventory.</p>
             </>}
 
             <div className="inventory-field inventory-field-wide">
@@ -364,20 +517,44 @@ export default function Inventory() {
           {notice && <div className={`inventory-notice ${notice.includes("added") || notice.includes("recorded") ? "notice-success" : "notice-warning"}`} role="status">{notice.includes("added") || notice.includes("recorded") ? <CheckCircle2 size={16} /> : <XCircle size={16} />}{notice}</div>}
 
           <div className="inventory-form-actions">
-            <span><ShieldCheck size={14} /> Duplicate identifier check in this demo</span>
+            <span><ShieldCheck size={14} /> Identifier check in this browser</span>
             <button className="button button-primary" onClick={handleSave}>{movement === "Receive stock" ? <><PackagePlus size={16} /> Add device</> : <><ClipboardList size={16} /> Record movement</>}</button>
           </div>
-          <p className="inventory-disclaimer">Prototype only: entries live in temporary page state and disappear on refresh. Secure storage, shop-wide duplicate checks and offline sync are not connected yet.</p>
+          <p className="inventory-disclaimer">Prototype only: inventory is saved in this browser's local storage. It is not backed up or synced between devices; secure storage and offline sync are not connected yet.</p>
         </section>
 
         <section className="surface-card inventory-list-card">
           <div className="inventory-card-heading">
             <div><div className="card-kicker">STOCK REGISTER</div><h2>Recently updated devices</h2></div>
-            <span className="inventory-count">{devices.length} demo records</span>
+            <span className="inventory-count">
+              {inventoryReadState.hasValidSnapshot
+                ? `${devices.length} inventory records`
+                : "Inventory unavailable"}
+            </span>
           </div>
           <label className="inventory-list-search"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search model, identifier or status" /></label>
           <div className="inventory-device-list">
-            {filteredDevices.length === 0 ? <div className="inventory-empty"><Smartphone size={24} /><strong>No matching devices</strong><span>Try another search or add a demo record.</span></div> : filteredDevices.map((device) => (
+            {!inventoryReadState.hasValidSnapshot ? (
+              <div className="inventory-empty">
+                <Smartphone size={24} />
+                <strong>Inventory unavailable</strong>
+                <span>Browser storage could not be read, so inventory records cannot be verified.</span>
+              </div>
+            ) : filteredDevices.length === 0 ? (
+              <div className="inventory-empty">
+                <Smartphone size={24} />
+                <strong>
+                  {inventoryReadState.readError
+                    ? "No matching items in the last successfully loaded inventory"
+                    : "No matching items"}
+                </strong>
+                <span>
+                  {inventoryReadState.readError
+                    ? "The latest inventory could not be verified."
+                    : "Try another search or add an inventory item."}
+                </span>
+              </div>
+            ) : filteredDevices.map((device) => (
               <article className="inventory-device-row" key={device.id}>
                 <div className="inventory-device-icon"><Smartphone size={18} /></div>
                 <div className="inventory-device-copy"><strong>{device.brand} {device.model}</strong><span className="inventory-identifier">{device.identifier}</span><span className="inventory-device-updated">{[device.category === "Accessory / spare part" ? `Qty ${device.quantity ?? 1}` : device.storage, device.colour, device.condition, device.networkStatus].filter(Boolean).join(" · ")}</span><span className="inventory-device-updated">{device.updated}</span></div>
@@ -385,7 +562,7 @@ export default function Inventory() {
               </article>
             ))}
           </div>
-          <div className="inventory-list-footer"><span><span className="inventory-footer-dot" /> Sample records only</span><span>Private identifiers should never be shown in a public demo.</span></div>
+          <div className="inventory-list-footer"><span><span className="inventory-footer-dot" /> Stored in this browser</span><span>Private identifiers should never be shown in a public demo.</span></div>
         </section>
       </div>
       {scannerOpen && <CameraScanner onClose={() => setScannerOpen(false)} onDetected={setIdentifier} title={`Scan ${targetField === "serial" ? "serial number" : targetField === "imei2" ? "IMEI 2" : "IMEI 1"}`} />}

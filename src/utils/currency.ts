@@ -6,6 +6,22 @@ export type ShopSettings = {
   currencyCode: CurrencyCode;
 };
 
+export type ShopSettingsSnapshot =
+  | { status: "missing"; raw: null; settings: ShopSettings }
+  | {
+      status: "valid";
+      raw: string;
+      settings: ShopSettings;
+      storedFields: Record<string, unknown>;
+    }
+  | {
+      status: "invalid";
+      raw: string;
+      message: string;
+      storedFields?: Record<string, unknown>;
+    }
+  | { status: "unavailable"; raw: null; message: string };
+
 export type CurrencyOption = {
   code: CurrencyCode;
   label: string;
@@ -86,30 +102,129 @@ export const CURRENCY_OPTIONS: CurrencyOption[] =
     decimalPlaces: getDecimalPlaces(code),
   }));
 
-export function getShopSettings(): ShopSettings {
+// Match the currencies presented by StockPilot, rather than accepting any
+// three-letter code that Intl happens to format.
+const SUPPORTED_CURRENCY_CODES = new Set(
+  CURRENCY_OPTIONS.map((option) => option.code)
+);
+
+export function getShopSettingsSnapshot(): ShopSettingsSnapshot {
   try {
-    const saved = localStorage.getItem(SETTINGS_STORAGE_KEY);
+    const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
 
-    if (saved) {
-      const parsed = JSON.parse(saved) as Partial<ShopSettings>;
+    if (raw === null) {
+      return { status: "missing", raw, settings: DEFAULT_SETTINGS };
+    }
 
+    let parsed: unknown;
+
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
       return {
-        shopName: parsed.shopName || DEFAULT_SETTINGS.shopName,
-        currencyCode: isCurrencyCode(parsed.currencyCode)
-          ? parsed.currencyCode
-          : DEFAULT_SETTINGS.currencyCode,
+        status: "invalid",
+        raw,
+        message:
+          "Saved shop settings are malformed and could not be parsed. Review them manually; the previous shop name cannot be recovered safely.",
       };
     }
+
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {
+        status: "invalid",
+        raw,
+        message:
+          "Saved shop settings have an invalid format. Review them manually; a previous shop name cannot be recovered safely.",
+      };
+    }
+
+    const storedFields = parsed as Record<string, unknown>;
+    const saved = parsed as Partial<ShopSettings>;
+
+    if (!isCurrencyCode(saved.currencyCode)) {
+      return {
+        status: "invalid",
+        raw,
+        message:
+          "Saved shop currency is missing or invalid. Safely parsed settings were preserved; choose a currency explicitly to repair them.",
+        storedFields,
+      };
+    }
+
+    if (typeof saved.shopName !== "string" || !saved.shopName.trim()) {
+      return {
+        status: "invalid",
+        raw,
+        message:
+          "Saved shop name is missing or invalid. Safely parsed settings were preserved; enter a shop name and choose a currency explicitly to repair them.",
+        storedFields,
+      };
+    }
+
+    return {
+      status: "valid",
+      raw,
+      settings: {
+        shopName: saved.shopName,
+        currencyCode: saved.currencyCode,
+      },
+      storedFields,
+    };
   } catch (error) {
     console.error("Could not load shop settings:", error);
+    return {
+      status: "unavailable",
+      raw: null,
+      message: "Shop settings could not be read from browser storage.",
+    };
   }
-
-  return DEFAULT_SETTINGS;
 }
 
-export function saveShopSettings(settings: ShopSettings): void {
+export function getShopSettings(): ShopSettings | null {
+  const snapshot = getShopSettingsSnapshot();
+  return snapshot.status === "valid" || snapshot.status === "missing"
+    ? snapshot.settings
+    : null;
+}
+
+export function getShopCurrency(): CurrencyCode | null {
+  const snapshot = getShopSettingsSnapshot();
+  return snapshot.status === "valid" || snapshot.status === "missing"
+    ? snapshot.settings.currencyCode
+    : null;
+}
+
+export function saveShopSettings(
+  settings: ShopSettings,
+  expectedRaw: string | null,
+  allowRepair = false,
+): "saved" | "conflict" | "invalid" | "error" {
   try {
-    const settingsToSave: ShopSettings = {
+    const current = getShopSettingsSnapshot();
+
+    if (current.status === "unavailable") {
+      return "error";
+    }
+
+    if (current.raw !== expectedRaw) {
+      return "conflict";
+    }
+
+    if (current.status === "invalid" && !allowRepair) {
+      return "invalid";
+    }
+
+    if (!isCurrencyCode(settings.currencyCode)) {
+      return "invalid";
+    }
+
+    const preservedFields =
+      current.status === "valid" || current.status === "invalid"
+        ? current.storedFields ?? {}
+        : {};
+
+    const settingsToSave = {
+      ...preservedFields,
       shopName: settings.shopName.trim(),
       currencyCode: settings.currencyCode,
     };
@@ -118,33 +233,30 @@ export function saveShopSettings(settings: ShopSettings): void {
       SETTINGS_STORAGE_KEY,
       JSON.stringify(settingsToSave),
     );
+    return "saved";
   } catch (error) {
     console.error("Could not save shop settings:", error);
+    return "error";
   }
-}
-
-export function getShopCurrency(): CurrencyCode {
-  return getShopSettings().currencyCode;
 }
 
 export function isCurrencyCode(value: unknown): value is CurrencyCode {
-  if (typeof value !== "string" || !/^[A-Z]{3}$/.test(value)) {
-    return false;
-  }
-
-  try {
-    new Intl.NumberFormat("en-US", {
-      style: "currency",
-      currency: value,
-    });
-
-    return true;
-  } catch {
-    return false;
-  }
+  return (
+    typeof value === "string" &&
+    SUPPORTED_CURRENCY_CODES.has(value)
+  );
 }
 
-// Existing records without a currency code remain UGX.
+// Strict lookup for record snapshots. Unknown historical currency must not be
+// treated as a real currency in display or financial calculations.
+export function getKnownRecordCurrency(
+  currencyCode: unknown,
+): CurrencyCode | null {
+  return isCurrencyCode(currencyCode) ? currencyCode : null;
+}
+
+// Backward-compatible fallback for callers whose business rule explicitly
+// requires a default. Do not use this for historical financial records.
 export function getRecordCurrency(
   currencyCode?: string | null,
 ): CurrencyCode {
@@ -153,16 +265,30 @@ export function getRecordCurrency(
 
 export function formatCurrency(
   amount: number,
-  currencyCode: CurrencyCode = "UGX",
+  currencyCode?: string | null,
 ): string {
-  const safeCurrency = getRecordCurrency(currencyCode);
+  const safeCurrency = getKnownRecordCurrency(currencyCode);
+
+  if (!Number.isFinite(amount)) {
+    return safeCurrency
+      ? `Amount unavailable (${safeCurrency})`
+      : "Amount and currency unavailable";
+  }
+
+  if (!safeCurrency) {
+    const amountWithoutCurrency = new Intl.NumberFormat("en-US", {
+      maximumFractionDigits: 20,
+    }).format(amount);
+
+    return `${amountWithoutCurrency} (currency unavailable)`;
+  }
 
   return new Intl.NumberFormat("en-US", {
     style: "currency",
     currency: safeCurrency,
     minimumFractionDigits: getDecimalPlaces(safeCurrency),
     maximumFractionDigits: getDecimalPlaces(safeCurrency),
-  }).format(Number.isFinite(amount) ? amount : 0);
+  }).format(amount);
 }
 
 export function parseMoneyInput(value: string): number {
@@ -171,13 +297,74 @@ export function parseMoneyInput(value: string): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+// A numeric zero is a known cost; missing, malformed, non-finite, and negative
+// values remain unknown instead of being treated as zero.
+export function getKnownCostAmount(value: unknown): number | null {
+  if (typeof value === "number") {
+    return Number.isFinite(value) && value >= 0 ? value : null;
+  }
+
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim();
+  if (
+    normalized === "" ||
+    !/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(normalized)
+  ) {
+    return null;
+  }
+
+  const amount = Number(normalized);
+  return Number.isFinite(amount) && amount >= 0 ? amount : null;
+}
+
+export function getKnownNonNegativeAmount(value: unknown): number | null {
+  return typeof value === "number" &&
+    Number.isFinite(value) &&
+    value >= 0
+    ? value
+    : null;
+}
+
+export function getKnownOutstandingBalance(
+  principal: unknown,
+  paid: unknown,
+): number | null {
+  const knownPrincipal = getKnownNonNegativeAmount(principal);
+  const knownPaid = getKnownNonNegativeAmount(paid);
+
+  if (
+    knownPrincipal === null ||
+    knownPaid === null ||
+    knownPaid > knownPrincipal
+  ) {
+    return null;
+  }
+
+  const balance = knownPrincipal - knownPaid;
+  return Number.isFinite(balance) ? balance : null;
+}
+
+export function getKnownSaleAmount(value: unknown): number | null {
+  return getKnownNonNegativeAmount(value);
+}
+
+export function getKnownStockQuantity(value: unknown): number | null {
+  return typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0
+    ? value
+    : null;
+}
+
 export function formatMoneyInput(
   value: string,
   currencyCode: CurrencyCode,
 ): string {
-  const decimalPlaces = getDecimalPlaces(
-    getRecordCurrency(currencyCode),
-  );
+  const knownCurrency = getKnownRecordCurrency(currencyCode);
+  const decimalPlaces = knownCurrency ? getDecimalPlaces(knownCurrency) : 2;
 
   const cleaned = value
     .replace(/,/g, "")
@@ -210,23 +397,65 @@ export function getSavedExchangeRateSnapshot(
 
     if (!saved) return null;
 
-    const parsed = JSON.parse(saved) as Record<
-      string,
-      ExchangeRateSnapshot
-    >;
-
-    const snapshot = parsed[baseCode];
-
+    const parsed: unknown = JSON.parse(saved);
     if (
-      !snapshot ||
-      snapshot.baseCode !== baseCode ||
-      typeof snapshot.rates !== "object" ||
-      !snapshot.rates
+      parsed === null ||
+      typeof parsed !== "object" ||
+      Array.isArray(parsed)
     ) {
       return null;
     }
 
-    return snapshot;
+    const snapshot = (parsed as Record<string, unknown>)[baseCode];
+
+    if (
+      snapshot === null ||
+      typeof snapshot !== "object" ||
+      Array.isArray(snapshot)
+    ) {
+      return null;
+    }
+
+    const candidate = snapshot as Record<string, unknown>;
+    const rates = candidate.rates;
+    if (
+      candidate.baseCode !== baseCode ||
+      typeof candidate.fetchedAt !== "string" ||
+      !Number.isFinite(Date.parse(candidate.fetchedAt)) ||
+      typeof candidate.lastUpdatedAt !== "string" ||
+      !Number.isFinite(Date.parse(candidate.lastUpdatedAt)) ||
+      typeof candidate.nextUpdateAt !== "string" ||
+      !Number.isFinite(Date.parse(candidate.nextUpdateAt)) ||
+      typeof candidate.provider !== "string" ||
+      !candidate.provider.trim() ||
+      rates === null ||
+      typeof rates !== "object" ||
+      Array.isArray(rates)
+    ) {
+      return null;
+    }
+
+    const knownRates: Record<string, number> = {};
+    for (const [code, rate] of Object.entries(rates)) {
+      if (
+        !isCurrencyCode(code) ||
+        typeof rate !== "number" ||
+        !Number.isFinite(rate) ||
+        rate <= 0
+      ) {
+        return null;
+      }
+      knownRates[code] = rate;
+    }
+
+    return {
+      baseCode,
+      rates: knownRates,
+      fetchedAt: candidate.fetchedAt,
+      lastUpdatedAt: candidate.lastUpdatedAt,
+      nextUpdateAt: candidate.nextUpdateAt,
+      provider: candidate.provider,
+    };
   } catch (error) {
     console.error("Could not read exchange-rate snapshot:", error);
     return null;
@@ -315,9 +544,19 @@ export async function refreshExchangeRateSnapshot(
 
   try {
     const saved = localStorage.getItem(EXCHANGE_RATES_STORAGE_KEY);
-    const allSnapshots = saved
-      ? (JSON.parse(saved) as Record<string, ExchangeRateSnapshot>)
-      : {};
+    let allSnapshots: Record<string, unknown> = {};
+
+    if (saved !== null) {
+      const parsed: unknown = JSON.parse(saved);
+      if (
+        parsed === null ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed)
+      ) {
+        throw new Error("Saved exchange-rate snapshots have an invalid format.");
+      }
+      allSnapshots = parsed as Record<string, unknown>;
+    }
 
     allSnapshots[baseCode] = snapshot;
 
@@ -339,13 +578,15 @@ export async function refreshExchangeRateSnapshot(
 // to calculate its UGX equivalent.
 export function convertToSnapshotCurrency(
   amount: number,
-  fromCode: CurrencyCode,
+  fromCode: string | null | undefined,
   snapshot: ExchangeRateSnapshot,
 ): number | null {
   if (!Number.isFinite(amount)) return null;
 
-  const sourceCode = getRecordCurrency(fromCode);
-  const baseCode = snapshot.baseCode;
+  const sourceCode = getKnownRecordCurrency(fromCode);
+  const baseCode = getKnownRecordCurrency(snapshot.baseCode);
+
+  if (!sourceCode || !baseCode) return null;
 
   if (sourceCode === baseCode) return amount;
 
@@ -359,5 +600,6 @@ export function convertToSnapshotCurrency(
     return null;
   }
 
-  return amount / sourceRate;
+  const converted = amount / sourceRate;
+  return Number.isFinite(converted) ? converted : null;
 }

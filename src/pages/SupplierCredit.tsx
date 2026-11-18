@@ -15,10 +15,15 @@ import {
 import {
   CURRENCY_OPTIONS,
   convertToSnapshotCurrency,
+  EXCHANGE_RATES_STORAGE_KEY,
   formatCurrency,
-  getRecordCurrency,
+  getKnownNonNegativeAmount,
+  getKnownOutstandingBalance,
+  getKnownRecordCurrency,
   getSavedExchangeRateSnapshot,
   getShopCurrency,
+  isExchangeRateSnapshotExpired,
+  SETTINGS_STORAGE_KEY,
   refreshExchangeRateSnapshot,
   type CurrencyCode,
   type ExchangeRateSnapshot,
@@ -50,9 +55,22 @@ type CreditRecord = {
 type ConvertedTotal = {
   amount: number;
   missingCurrencies: CurrencyCode[];
+  unresolvedCurrencyRecords: number;
+  invalidAmountRecords: number;
 };
 
 const STORAGE_KEY = "stockpilot-credit-records";
+
+type CreditStorageSnapshot = {
+  raw: string | null;
+  records: CreditRecord[];
+};
+
+type CreditStorageReadState = {
+  records: CreditRecord[];
+  hasValidSnapshot: boolean;
+  readError: boolean;
+};
 
 // Format numbers with thousands separators while preserving decimals.
 function formatAmountInput(value: string): string {
@@ -78,6 +96,25 @@ function formatAmountInput(value: string): string {
 // Remove display commas before converting the value into a number.
 function parseAmountInput(value: string): number {
   return Number(value.replace(/,/g, ""));
+}
+
+function isCreditPayment(value: unknown): value is CreditPayment {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value)
+  ) {
+    return false;
+  }
+
+  const payment = value as Record<string, unknown>;
+  return (
+    typeof payment.id === "string" &&
+    typeof payment.amount === "number" &&
+    Number.isFinite(payment.amount) &&
+    payment.amount >= 0 &&
+    typeof payment.date === "string"
+  );
 }
 
 // Update the displayed value while keeping the cursor in the correct position.
@@ -121,47 +158,93 @@ function handleFormattedAmountChange(
   });
 }
 
-function readRecords(): CreditRecord[] {
+function readRecordSnapshot(): CreditStorageSnapshot | null {
   try {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (!saved) return [];
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw === null) return { raw, records: [] };
 
-    const parsed: unknown = JSON.parse(saved);
+    const parsed: unknown = JSON.parse(raw);
 
-    if (!Array.isArray(parsed)) return [];
+    if (!Array.isArray(parsed)) return null;
 
-    return parsed.map((record) => ({
-      ...record,
-      payments: Array.isArray(record.payments) ? record.payments : [],
-    })) as CreditRecord[];
+    const records: CreditRecord[] = [];
+    for (const value of parsed) {
+      if (
+        value === null ||
+        typeof value !== "object" ||
+        Array.isArray(value)
+      ) {
+        return null;
+      }
+
+      const record = value as Record<string, unknown>;
+      const hasPayments = Object.prototype.hasOwnProperty.call(
+        record,
+        "payments"
+      );
+
+      if (
+        hasPayments &&
+        (!Array.isArray(record.payments) ||
+          !record.payments.every(isCreditPayment))
+      ) {
+        return null;
+      }
+
+      records.push({
+        ...record,
+        // Older records predate the payments field; only a missing field is
+        // normalized. A present but invalid value makes the ledger unreadable.
+        payments: hasPayments ? (record.payments as CreditPayment[]) : [],
+      } as CreditRecord);
+    }
+
+    return {
+      raw,
+      records,
+    };
   } catch {
-    return [];
+    return null;
   }
 }
 
-function getCurrency(record: CreditRecord): CurrencyCode {
-  return getRecordCurrency(record.currencyCode);
+function toCreditStorageReadState(
+  snapshot: CreditStorageSnapshot | null
+): CreditStorageReadState {
+  return {
+    records: snapshot?.records ?? [],
+    hasValidSnapshot: snapshot !== null,
+    readError: snapshot === null,
+  };
+}
+
+function getCurrency(record: CreditRecord): CurrencyCode | null {
+  return getKnownRecordCurrency(record.currencyCode);
 }
 
 function getPaidAmount(record: CreditRecord) {
-  return record.payments.reduce(
-    (total, payment) => total + (Number(payment.amount) || 0),
-    0
-  );
+  return record.payments.reduce<number | null>((total, payment) => {
+    if (total === null) return null;
+    const updated = total + payment.amount;
+    return Number.isFinite(updated) ? updated : null;
+  }, 0);
 }
 
-function getBalance(record: CreditRecord) {
-  return Math.max(0, record.originalAmount - getPaidAmount(record));
+function getBalance(record: CreditRecord): number | null {
+  const paidAmount = getPaidAmount(record);
+  return getKnownOutstandingBalance(record.originalAmount, paidAmount);
 }
 
 function getStatus(record: CreditRecord) {
   const balance = getBalance(record);
 
+  if (balance === null) return "Invalid amount";
   if (balance <= 0) return "Paid";
 
   if (record.dueDate && record.dueDate < getToday()) return "Overdue";
 
-  if (getPaidAmount(record) > 0) return "Part-paid";
+  const paidAmount = getPaidAmount(record);
+  if (paidAmount !== null && paidAmount > 0) return "Part-paid";
 
   return "Outstanding";
 }
@@ -191,6 +274,8 @@ function getConvertedTotal(
   snapshot: ExchangeRateSnapshot | null
 ): ConvertedTotal {
   let total = 0;
+  let unresolvedCurrencyRecords = 0;
+  let invalidAmountRecords = 0;
   const missingCurrencies = new Set<CurrencyCode>();
 
   records
@@ -198,12 +283,25 @@ function getConvertedTotal(
     .forEach((record) => {
       const balance = getBalance(record);
 
+      if (balance === null) {
+        invalidAmountRecords += 1;
+        return;
+      }
       if (balance <= 0) return;
 
       const recordCurrency = getCurrency(record);
+      if (!recordCurrency) {
+        unresolvedCurrencyRecords += 1;
+        return;
+      }
 
       if (recordCurrency === baseCurrency) {
-        total += balance;
+        const updated = total + balance;
+        if (!Number.isFinite(updated)) {
+          invalidAmountRecords += 1;
+          return;
+        }
+        total = updated;
         return;
       }
 
@@ -223,26 +321,69 @@ function getConvertedTotal(
         return;
       }
 
-      total += converted;
+      const updated = total + converted;
+      if (!Number.isFinite(updated)) {
+        invalidAmountRecords += 1;
+        return;
+      }
+      total = updated;
     });
 
   return {
     amount: total,
     missingCurrencies: Array.from(missingCurrencies).sort(),
+    unresolvedCurrencyRecords,
+    invalidAmountRecords,
   };
 }
 
+function countUnresolvedBalances(
+  records: CreditRecord[],
+  type: CreditType
+): number {
+  return records.filter(
+    (record) => {
+      const balance = getBalance(record);
+      return (
+        record.type === type &&
+        balance !== null &&
+        balance > 0 &&
+        !getCurrency(record)
+      );
+    }
+  ).length;
+}
+
+function countInvalidBalances(
+  records: CreditRecord[],
+  type: CreditType
+): number {
+  return records.filter(
+    (record) => record.type === type && getBalance(record) === null
+  ).length;
+}
+
 export default function SupplierCredit() {
-  const [records, setRecords] = useState<CreditRecord[]>(readRecords);
+  const [recordReadState, setRecordReadState] = useState(() =>
+    toCreditStorageReadState(readRecordSnapshot())
+  );
+  const records = recordReadState.records;
   const [activeTab, setActiveTab] = useState<"All" | CreditType>("All");
   const [showForm, setShowForm] = useState(false);
   const [notice, setNotice] = useState("");
 
-  const [shopCurrency] = useState<CurrencyCode>(() => getShopCurrency());
+  const [shopCurrency, setShopCurrency] = useState<CurrencyCode | null>(
+    () => getShopCurrency()
+  );
 
   const [exchangeSnapshot, setExchangeSnapshot] =
     useState<ExchangeRateSnapshot | null>(() =>
-      getSavedExchangeRateSnapshot(getShopCurrency())
+      (() => {
+        const initialShopCurrency = getShopCurrency();
+        return initialShopCurrency
+          ? getSavedExchangeRateSnapshot(initialShopCurrency)
+          : null;
+      })()
     );
 
   const [rateMessage, setRateMessage] = useState(
@@ -256,7 +397,16 @@ export default function SupplierCredit() {
   const [description, setDescription] = useState("");
   const [amount, setAmount] = useState("");
   const [currencyCode, setCurrencyCode] = useState<CurrencyCode>(
+    () => getShopCurrency() ?? ""
+  );
+  const [creditCurrencyManuallySelected, setCreditCurrencyManuallySelected] =
+    useState(false);
+  const [creditCurrencyNeedsReview, setCreditCurrencyNeedsReview] =
+    useState(false);
+  const [currencySettingsNotice, setCurrencySettingsNotice] = useState(() =>
     getShopCurrency()
+      ? ""
+      : "Shop currency settings are invalid or unavailable. Select this record's currency explicitly and review Workspace settings."
   );
   const [dueDate, setDueDate] = useState("");
 
@@ -265,19 +415,95 @@ export default function SupplierCredit() {
   const [paymentDate, setPaymentDate] = useState(getToday());
 
   useEffect(() => {
-    const refresh = () => setRecords(readRecords());
+    const refreshSettings = () => {
+      const latestShopCurrency = getShopCurrency();
+      setShopCurrency(latestShopCurrency);
+      setCurrencySettingsNotice(
+        latestShopCurrency
+          ? ""
+          : "Shop currency settings are invalid or unavailable. Select this record's currency explicitly and review Workspace settings."
+      );
+      if (!creditCurrencyManuallySelected) {
+        if (!latestShopCurrency) {
+          setCurrencyCode("");
+          setCreditCurrencyNeedsReview(true);
+        } else if (latestShopCurrency !== currencyCode) {
+          setCurrencyCode(latestShopCurrency);
+          setCreditCurrencyNeedsReview(true);
+        }
+      }
+    };
 
-    window.addEventListener("focus", refresh);
+    const refresh = (event?: StorageEvent) => {
+      if (
+        event &&
+        event.key !== STORAGE_KEY &&
+        event.key !== SETTINGS_STORAGE_KEY &&
+        event.key !== EXCHANGE_RATES_STORAGE_KEY &&
+        event.key !== null
+      ) {
+        return;
+      }
+
+      if (!event || event.key === STORAGE_KEY || event.key === null) {
+        const latest = readRecordSnapshot();
+        setRecordReadState((current) =>
+          latest
+            ? {
+                records:
+                  JSON.stringify(current.records) ===
+                  JSON.stringify(latest.records)
+                    ? current.records
+                    : latest.records,
+                hasValidSnapshot: true,
+                readError: false,
+              }
+            : current.readError
+              ? current
+              : { ...current, readError: true }
+        );
+      }
+
+      if (!event || event.key === SETTINGS_STORAGE_KEY || event.key === null) {
+        refreshSettings();
+      }
+
+      if (
+        shopCurrency &&
+        (!event ||
+          event.key === EXCHANGE_RATES_STORAGE_KEY ||
+          event.key === SETTINGS_STORAGE_KEY ||
+          event.key === null)
+      ) {
+        const latestRates = getSavedExchangeRateSnapshot(
+          getShopCurrency() ?? shopCurrency
+        );
+        setExchangeSnapshot(latestRates);
+      }
+    };
+    const refreshOnFocus = () => refresh();
+
+    window.addEventListener("focus", refreshOnFocus);
     window.addEventListener("storage", refresh);
 
     return () => {
-      window.removeEventListener("focus", refresh);
+      window.removeEventListener("focus", refreshOnFocus);
       window.removeEventListener("storage", refresh);
     };
-  }, []);
+  }, [creditCurrencyManuallySelected, currencyCode, shopCurrency]);
 
   useEffect(() => {
     let cancelled = false;
+
+    if (!shopCurrency) {
+      setExchangeSnapshot(null);
+      setRateMessage(
+        "Shop currency settings are invalid or unavailable. Exchange-rate totals cannot be calculated."
+      );
+      return () => {
+        cancelled = true;
+      };
+    }
 
     const savedSnapshot = getSavedExchangeRateSnapshot(shopCurrency);
 
@@ -310,7 +536,13 @@ export default function SupplierCredit() {
         if (savedSnapshot) {
           setExchangeSnapshot(savedSnapshot);
           setRateMessage(
-            "Could not refresh exchange rates. Using the last successfully saved rates."
+            `Could not refresh exchange rates. Using the saved snapshot last updated ${new Date(
+              savedSnapshot.lastUpdatedAt
+            ).toLocaleString()}${
+              isExchangeRateSnapshotExpired(savedSnapshot)
+                ? " (expired)."
+                : "."
+            }`
           );
         } else {
           setRateMessage(
@@ -327,18 +559,67 @@ export default function SupplierCredit() {
     };
   }, [shopCurrency]);
 
-  const saveRecords = (updated: CreditRecord[]) => {
+  const saveRecords = (
+    updated: CreditRecord[],
+    expectedRaw: string | null,
+  ): boolean => {
     try {
+      if (localStorage.getItem(STORAGE_KEY) !== expectedRaw) {
+        const latest = readRecordSnapshot();
+        if (latest) {
+          setRecordReadState({
+            records: latest.records,
+            hasValidSnapshot: true,
+            readError: false,
+          });
+        } else {
+          setRecordReadState((current) =>
+            current.readError ? current : { ...current, readError: true }
+          );
+        }
+        setNotice(
+          "Credit records changed in another tab. The latest records were loaded; review and try again."
+        );
+        return false;
+      }
+
       localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
-      setRecords(updated);
+      setRecordReadState({
+        records: updated,
+        hasValidSnapshot: true,
+        readError: false,
+      });
+      return true;
     } catch {
       setNotice(
         "Could not save credit records. Check available browser storage."
       );
+      return false;
     }
   };
 
   const totals = useMemo(() => {
+    if (!shopCurrency) {
+      return {
+        payables: {
+          amount: 0,
+          missingCurrencies: [] as CurrencyCode[],
+          unresolvedCurrencyRecords: countUnresolvedBalances(records, "Payable"),
+          invalidAmountRecords: countInvalidBalances(records, "Payable"),
+        },
+        receivables: {
+          amount: 0,
+          missingCurrencies: [] as CurrencyCode[],
+          unresolvedCurrencyRecords: countUnresolvedBalances(records, "Receivable"),
+          invalidAmountRecords: countInvalidBalances(records, "Receivable"),
+        },
+        overdue: records.filter(
+          (record) => getStatus(record) === "Overdue"
+        ).length,
+        open: records.filter((record) => (getBalance(record) ?? 0) > 0).length,
+      };
+    }
+
     return {
       payables: getConvertedTotal(
         records,
@@ -355,7 +636,7 @@ export default function SupplierCredit() {
       overdue: records.filter(
         (record) => getStatus(record) === "Overdue"
       ).length,
-      open: records.filter((record) => getBalance(record) > 0).length,
+      open: records.filter((record) => (getBalance(record) ?? 0) > 0).length,
     };
   }, [records, shopCurrency, exchangeSnapshot]);
 
@@ -372,6 +653,44 @@ export default function SupplierCredit() {
   const addRecord = () => {
     const parsedAmount = parseAmountInput(amount);
 
+    if (!creditCurrencyManuallySelected) {
+      const currentShopCurrency = getShopCurrency();
+
+      if (!currentShopCurrency) {
+        setShopCurrency(null);
+        setCurrencyCode("");
+        setCreditCurrencyNeedsReview(true);
+        setNotice(
+          "Shop currency settings are invalid or unavailable. Select this record's currency explicitly before saving."
+        );
+        return;
+      }
+
+      if (currentShopCurrency !== currencyCode) {
+        setShopCurrency(currentShopCurrency);
+        setCurrencyCode(currentShopCurrency);
+        setCreditCurrencyNeedsReview(true);
+        setNotice(
+          "Shop currency changed. Review the amount and confirm the record currency before saving."
+        );
+        return;
+      }
+    }
+
+    if (creditCurrencyNeedsReview) {
+      setNotice(
+        "Review the credit amount and currency, then confirm before saving."
+      );
+      return;
+    }
+
+    if (!currencyCode) {
+      setNotice(
+        currencySettingsNotice || "Select a currency before saving the credit record."
+      );
+      return;
+    }
+
     if (!party.trim()) {
       setNotice("Enter the supplier or customer name.");
       return;
@@ -382,8 +701,20 @@ export default function SupplierCredit() {
       return;
     }
 
+    const latest = readRecordSnapshot();
+
+    if (!latest) {
+      setRecordReadState((current) =>
+        current.readError ? current : { ...current, readError: true }
+      );
+      setNotice(
+        "Could not safely read saved credit records. No changes were made; check browser storage before trying again."
+      );
+      return;
+    }
+
     const record: CreditRecord = {
-      id: `CREDIT-${Date.now()}`,
+      id: `CREDIT-${crypto.randomUUID()}`,
       type,
       party: party.trim(),
       contact: contact.trim(),
@@ -396,7 +727,7 @@ export default function SupplierCredit() {
       payments: [],
     };
 
-    saveRecords([record, ...records]);
+    if (!saveRecords([record, ...latest.records], latest.raw)) return;
 
     setParty("");
     setContact("");
@@ -404,15 +735,60 @@ export default function SupplierCredit() {
     setDescription("");
     setAmount("");
     setDueDate("");
-    setCurrencyCode(getShopCurrency());
+    const currentShopCurrency = getShopCurrency();
+    setCurrencyCode(currentShopCurrency ?? "");
+    setCreditCurrencyManuallySelected(false);
+    setCreditCurrencyNeedsReview(false);
+    setCurrencySettingsNotice(
+      currentShopCurrency
+        ? ""
+        : "Shop currency settings are invalid or unavailable. Select this record's currency explicitly and review Workspace settings."
+    );
     setShowForm(false);
     setNotice("Credit record saved successfully.");
   };
 
   const addPayment = (record: CreditRecord) => {
     const parsedAmount = parseAmountInput(paymentAmount);
-    const balance = getBalance(record);
-    const recordCurrency = getCurrency(record);
+    const latest = readRecordSnapshot();
+
+    if (!latest) {
+      setRecordReadState((current) =>
+        current.readError ? current : { ...current, readError: true }
+      );
+      setNotice(
+        "Could not safely read saved credit records. No payment was recorded; check browser storage before trying again."
+      );
+      return;
+    }
+
+    const currentRecord = latest.records.find((item) => item.id === record.id);
+
+    if (!currentRecord) {
+      setRecordReadState({
+        records: latest.records,
+        hasValidSnapshot: true,
+        readError: false,
+      });
+      setNotice("This credit record is no longer available. Latest records were loaded.");
+      return;
+    }
+
+    const recordCurrency = getCurrency(currentRecord);
+    if (!recordCurrency) {
+      setNotice(
+        "Cannot record a payment because this credit record has no valid saved currency. The record was not changed; resolve its currency first."
+      );
+      return;
+    }
+
+    const balance = getBalance(currentRecord);
+    if (balance === null) {
+      setNotice(
+        "Cannot record a payment because this credit record has an invalid principal or payment total. The record was not changed; review its saved amounts first."
+      );
+      return;
+    }
 
     if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
       setNotice("Enter a valid payment amount greater than zero.");
@@ -430,18 +806,18 @@ export default function SupplierCredit() {
     }
 
     const payment: CreditPayment = {
-      id: `PAY-${Date.now()}`,
+      id: `PAY-${crypto.randomUUID()}`,
       amount: parsedAmount,
       date: paymentDate || getToday(),
     };
 
-    const updated = records.map((item) =>
-      item.id === record.id
+    const updated = latest.records.map((item) =>
+      item.id === currentRecord.id
         ? { ...item, payments: [...item.payments, payment] }
         : item
     );
 
-    saveRecords(updated);
+    if (!saveRecords(updated, latest.raw)) return;
     setPaymentRecordId("");
     setPaymentAmount("");
     setPaymentDate(getToday());
@@ -467,6 +843,15 @@ export default function SupplierCredit() {
         </div>
       </div>
 
+      {recordReadState.readError && (
+        <div className="operations-note" role="alert">
+          <strong>Credit ledger unavailable.</strong>{" "}
+          {recordReadState.hasValidSnapshot
+            ? "The latest browser storage read failed. Showing the last successfully loaded records; totals may be out of date."
+            : "Browser storage could not be read. Credit totals and records are unavailable."}
+        </div>
+      )}
+
       <div className="credit-summary-grid">
         <article className="surface-card credit-summary-card">
           <div className="credit-summary-icon payable">
@@ -474,14 +859,35 @@ export default function SupplierCredit() {
           </div>
           <span>Supplier payables</span>
           <strong>
-            {formatCurrency(totals.payables.amount, shopCurrency)}
+            {recordReadState.hasValidSnapshot && shopCurrency
+              ? formatCurrency(totals.payables.amount, shopCurrency)
+              : "Unavailable"}
           </strong>
           <small>
-            Combined outstanding balance in {shopCurrency}
+            {!recordReadState.hasValidSnapshot
+              ? "Credit ledger data could not be read."
+              : shopCurrency
+              ? `Combined outstanding balance in ${shopCurrency}`
+              : "Shop currency is unavailable; converted total is not shown."}
           </small>
-          {totals.payables.missingCurrencies.length > 0 && (
+          {recordReadState.hasValidSnapshot &&
+            totals.payables.missingCurrencies.length > 0 && (
             <small>
               Not converted: {totals.payables.missingCurrencies.join(", ")}
+            </small>
+          )}
+          {recordReadState.hasValidSnapshot &&
+            totals.payables.unresolvedCurrencyRecords > 0 && (
+            <small>
+              Excluded: {totals.payables.unresolvedCurrencyRecords} open record(s)
+              with unavailable currency
+            </small>
+          )}
+          {recordReadState.hasValidSnapshot &&
+            totals.payables.invalidAmountRecords > 0 && (
+            <small>
+              Excluded: {totals.payables.invalidAmountRecords} record(s) with
+              invalid principal or payment totals
             </small>
           )}
         </article>
@@ -492,14 +898,35 @@ export default function SupplierCredit() {
           </div>
           <span>Customer receivables</span>
           <strong>
-            {formatCurrency(totals.receivables.amount, shopCurrency)}
+            {recordReadState.hasValidSnapshot && shopCurrency
+              ? formatCurrency(totals.receivables.amount, shopCurrency)
+              : "Unavailable"}
           </strong>
           <small>
-            Combined outstanding balance in {shopCurrency}
+            {!recordReadState.hasValidSnapshot
+              ? "Credit ledger data could not be read."
+              : shopCurrency
+              ? `Combined outstanding balance in ${shopCurrency}`
+              : "Shop currency is unavailable; converted total is not shown."}
           </small>
-          {totals.receivables.missingCurrencies.length > 0 && (
+          {recordReadState.hasValidSnapshot &&
+            totals.receivables.missingCurrencies.length > 0 && (
             <small>
               Not converted: {totals.receivables.missingCurrencies.join(", ")}
+            </small>
+          )}
+          {recordReadState.hasValidSnapshot &&
+            totals.receivables.unresolvedCurrencyRecords > 0 && (
+            <small>
+              Excluded: {totals.receivables.unresolvedCurrencyRecords} open record(s)
+              with unavailable currency
+            </small>
+          )}
+          {recordReadState.hasValidSnapshot &&
+            totals.receivables.invalidAmountRecords > 0 && (
+            <small>
+              Excluded: {totals.receivables.invalidAmountRecords} record(s)
+              with invalid principal or payment totals
             </small>
           )}
         </article>
@@ -509,7 +936,9 @@ export default function SupplierCredit() {
             <Receipt size={19} />
           </div>
           <span>Open credit records</span>
-          <strong>{totals.open}</strong>
+          <strong>
+            {recordReadState.hasValidSnapshot ? totals.open : "Unavailable"}
+          </strong>
           <small>Records with unpaid balances</small>
         </article>
 
@@ -518,7 +947,9 @@ export default function SupplierCredit() {
             <CalendarClock size={19} />
           </div>
           <span>Overdue records</span>
-          <strong>{totals.overdue}</strong>
+          <strong>
+            {recordReadState.hasValidSnapshot ? totals.overdue : "Unavailable"}
+          </strong>
           <small>Past due date with a balance</small>
         </article>
       </div>
@@ -610,16 +1041,38 @@ export default function SupplierCredit() {
                 <span>Currency *</span>
                 <select
                   value={currencyCode}
-                  onChange={(event) =>
-                    setCurrencyCode(event.target.value as CurrencyCode)
-                  }
+                  onChange={(event) => {
+                    setCurrencyCode(event.target.value as CurrencyCode);
+                    setCreditCurrencyManuallySelected(true);
+                    setCreditCurrencyNeedsReview(false);
+                  }}
                 >
+                  <option value="" disabled>
+                    Select a currency
+                  </option>
                   {CURRENCY_OPTIONS.map((currency) => (
                     <option key={currency.code} value={currency.code}>
                       {currency.code}
                     </option>
                   ))}
                 </select>
+                {currencySettingsNotice && (
+                  <small className="field-hint" role="status">
+                    {currencySettingsNotice}
+                  </small>
+                )}
+                {creditCurrencyNeedsReview && (
+                  <small className="field-hint" role="status">
+                    Shop currency changed. Review the amount, then{" "}
+                    <button
+                      className="button button-secondary"
+                      type="button"
+                      onClick={() => setCreditCurrencyNeedsReview(false)}
+                    >
+                      confirm this currency
+                    </button>
+                  </small>
+                )}
               </label>
 
               <label className="inventory-field">
@@ -689,12 +1142,24 @@ export default function SupplierCredit() {
           ))}
         </div>
 
-        {visibleRecords.length === 0 ? (
+        {!recordReadState.hasValidSnapshot ? (
           <div className="inventory-empty">
             <Banknote size={26} />
-            <strong>No credit records yet</strong>
+            <strong>Credit records unavailable</strong>
+            <span>Browser storage could not be read.</span>
+          </div>
+        ) : visibleRecords.length === 0 ? (
+          <div className="inventory-empty">
+            <Banknote size={26} />
+            <strong>
+              {recordReadState.readError
+                ? "No records in the last successful read"
+                : "No credit records yet"}
+            </strong>
             <span>
-              Create a supplier payable or customer receivable to begin.
+              {recordReadState.readError
+                ? "The current ledger could not be verified."
+                : "Create a supplier payable or customer receivable to begin."}
             </span>
           </div>
         ) : (
@@ -702,6 +1167,9 @@ export default function SupplierCredit() {
             {visibleRecords.map((record) => {
               const paid = getPaidAmount(record);
               const balance = getBalance(record);
+              const originalAmount = getKnownNonNegativeAmount(
+                record.originalAmount
+              );
               const status = getStatus(record);
               const paymentOpen = paymentRecordId === record.id;
               const recordCurrency = getCurrency(record);
@@ -743,7 +1211,24 @@ export default function SupplierCredit() {
                     )}
                     {record.description && <span>{record.description}</span>}
                     {record.contact && <span>{record.contact}</span>}
-                    <span>Currency: {recordCurrency}</span>
+                    <span>
+                      Currency: {recordCurrency ?? "Currency unavailable"}
+                    </span>
+                    {!recordCurrency && balance !== null && balance > 0 && (
+                      <small className="field-hint" role="status">
+                        Payments are blocked until this record's currency is
+                        explicitly resolved. Its original amount and balance
+                        are shown without a currency assumption.
+                      </small>
+                    )}
+                    {(originalAmount === null || paid === null || balance === null) && (
+                      <small className="field-hint" role="alert">
+                        This record has an invalid principal or payment total,
+                        including payments exceeding its principal. Its balance
+                        is excluded from summaries and payments are blocked
+                        until the saved amounts are reviewed.
+                      </small>
+                    )}
                     <span>Due: {formatDate(record.dueDate)}</span>
                   </div>
 
@@ -751,19 +1236,25 @@ export default function SupplierCredit() {
                     <div>
                       <span>Original amount</span>
                       <strong>
-                        {formatCurrency(record.originalAmount, recordCurrency)}
+                        {formatCurrency(
+                          originalAmount ?? Number.NaN,
+                          recordCurrency
+                        )}
                       </strong>
                     </div>
                     <div>
                       <span>Paid</span>
                       <strong>
-                        {formatCurrency(paid, recordCurrency)}
+                        {formatCurrency(paid ?? Number.NaN, recordCurrency)}
                       </strong>
                     </div>
                     <div>
                       <span>Remaining balance</span>
                       <strong className="credit-balance">
-                        {formatCurrency(balance, recordCurrency)}
+                        {formatCurrency(
+                          balance ?? Number.NaN,
+                          recordCurrency
+                        )}
                       </strong>
                     </div>
                   </div>
@@ -782,12 +1273,15 @@ export default function SupplierCredit() {
                     </div>
                   )}
 
-                  {balance > 0 && (
+                  {balance !== null && balance > 0 && (
                     <div className="credit-payment-actions">
                       {paymentOpen ? (
                         <div className="credit-payment-form">
                           <label className="inventory-field">
-                            <span>Payment amount ({recordCurrency})</span>
+                            <span>
+                              Payment amount (
+                              {recordCurrency ?? "currency unavailable"})
+                            </span>
                             <input
                               type="text"
                               inputMode="decimal"
@@ -814,6 +1308,7 @@ export default function SupplierCredit() {
                           <button
                             className="button button-primary"
                             onClick={() => addPayment(record)}
+                            disabled={!recordCurrency || balance === null}
                           >
                             <CheckCircle2 size={15} /> Record payment
                           </button>
@@ -827,6 +1322,7 @@ export default function SupplierCredit() {
                       ) : (
                         <button
                           className="button button-secondary"
+                          disabled={!recordCurrency || balance === null}
                           onClick={() => {
                             setPaymentRecordId(record.id);
                             setPaymentAmount("");

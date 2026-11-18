@@ -19,10 +19,20 @@ import {
 import {
   CURRENCY_OPTIONS,
   formatCurrency,
-  getRecordCurrency,
+  getKnownCostAmount,
+  getKnownRecordCurrency,
+  getKnownSaleAmount,
+  getKnownStockQuantity,
   getShopCurrency,
+  isCurrencyCode,
+  SETTINGS_STORAGE_KEY,
   type CurrencyCode,
 } from "../utils/currency";
+import {
+  getKnownPaymentMethod,
+  PAYMENT_METHODS,
+  type PaymentMethod,
+} from "../utils/sales";
 
 type ItemCategory = "Device" | "Accessory / spare part";
 
@@ -41,12 +51,6 @@ type DeviceRecord = {
   updated: string;
 };
 
-type PaymentMethod =
-  | "Cash"
-  | "MTN Mobile Money"
-  | "Airtel Money"
-  | "Bank Transfer";
-
 type SaleRecord = {
   id: string;
   deviceId: string;
@@ -55,7 +59,7 @@ type SaleRecord = {
   salePrice: number;
   paymentMethod: PaymentMethod;
   transactionDate: string;
-  costPrice: number;
+  costPrice: number | null;
   category?: ItemCategory;
   quantitySold?: number;
   unitPrice?: number;
@@ -66,22 +70,48 @@ type SaleRecord = {
 const INVENTORY_KEY = "stockpilot-inventory";
 const SALES_KEY = "stockpilot-sales";
 
-function readInventory(): DeviceRecord[] {
+type StoredArraySnapshot<T> = {
+  raw: string | null;
+  records: T[];
+};
+
+type StoredArrayReadState<T> = {
+  records: T[];
+  hasValidSnapshot: boolean;
+  readError: boolean;
+};
+
+function readStoredArray<T>(key: string): StoredArraySnapshot<T> | null {
   try {
-    const saved = localStorage.getItem(INVENTORY_KEY);
-    return saved ? (JSON.parse(saved) as DeviceRecord[]) : [];
+    const raw = localStorage.getItem(key);
+
+    if (raw === null) return { raw, records: [] };
+
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+
+    return { raw, records: parsed as T[] };
   } catch {
-    return [];
+    return null;
   }
 }
 
-function readSales(): SaleRecord[] {
-  try {
-    const saved = localStorage.getItem(SALES_KEY);
-    return saved ? (JSON.parse(saved) as SaleRecord[]) : [];
-  } catch {
-    return [];
-  }
+function toStoredArrayReadState<T>(
+  snapshot: StoredArraySnapshot<T> | null
+): StoredArrayReadState<T> {
+  return {
+    records: snapshot?.records ?? [],
+    hasValidSnapshot: snapshot !== null,
+    readError: snapshot === null,
+  };
+}
+
+function getLocalDateTimeInputValue(date = new Date()): string {
+  const localDate = new Date(
+    date.getTime() - date.getTimezoneOffset() * 60_000,
+  );
+
+  return localDate.toISOString().slice(0, 16);
 }
 
 function isAccessory(item: DeviceRecord) {
@@ -116,6 +146,13 @@ function parsePriceInput(value: string): number {
   return Number(value.replace(/,/g, ""));
 }
 
+function formatSaleAmount(sale: SaleRecord): string {
+  const amount = getKnownSaleAmount(sale.salePrice);
+  return amount === null
+    ? "Amount unavailable"
+    : formatCurrency(amount, getKnownRecordCurrency(sale.currencyCode));
+}
+
 function getCaretPosition(
   formattedValue: string,
   digitCount: number
@@ -140,18 +177,32 @@ function getCaretPosition(
 }
 
 export default function Sales() {
-  const [devices, setDevices] = useState<DeviceRecord[]>(readInventory);
-  const [sales, setSales] = useState<SaleRecord[]>(readSales);
+  const [inventoryReadState, setInventoryReadState] = useState(() =>
+    toStoredArrayReadState(readStoredArray<DeviceRecord>(INVENTORY_KEY))
+  );
+  const [salesReadState, setSalesReadState] = useState(() =>
+    toStoredArrayReadState(readStoredArray<SaleRecord>(SALES_KEY))
+  );
+  const devices = inventoryReadState.records;
+  const sales = salesReadState.records;
   const [search, setSearch] = useState("");
   const [selectedId, setSelectedId] = useState("");
   const [salePrice, setSalePrice] = useState("");
   const [saleCurrencyCode, setSaleCurrencyCode] =
-    useState<CurrencyCode>(getShopCurrency);
+    useState<CurrencyCode>(() => getShopCurrency() ?? "");
+  const [saleCurrencyManuallySelected, setSaleCurrencyManuallySelected] =
+    useState(false);
+  const [currencyNeedsReview, setCurrencyNeedsReview] = useState(false);
+  const [currencySettingsNotice, setCurrencySettingsNotice] = useState(() =>
+    getShopCurrency()
+      ? ""
+      : "Shop currency settings are invalid or unavailable. Select the sale currency explicitly and review Workspace settings."
+  );
   const [quantity, setQuantity] = useState("1");
   const [paymentMethod, setPaymentMethod] =
     useState<PaymentMethod>("Cash");
   const [transactionDate, setTransactionDate] = useState(
-    new Date().toISOString().slice(0, 16)
+    () => getLocalDateTimeInputValue()
   );
   const [notice, setNotice] = useState("");
 
@@ -207,32 +258,116 @@ export default function Sales() {
     ? isAccessory(selectedItem)
     : false;
 
-  const purchaseCurrency = selectedItem
-    ? getRecordCurrency(selectedItem.currencyCode)
-    : null;
+  const purchaseCurrency =
+    selectedItem && isCurrencyCode(selectedItem.currencyCode)
+      ? selectedItem.currencyCode
+      : null;
 
   const availableQuantity =
     selectedItem && selectedIsAccessory
-      ? Math.max(0, Number(selectedItem.quantity) || 0)
+      ? getKnownStockQuantity(selectedItem.quantity) ?? 0
       : 1;
 
   const requestedQuantity = selectedIsAccessory
-    ? Math.max(0, Number(quantity) || 0)
+    ? getKnownStockQuantity(Number(quantity)) ?? 0
     : 1;
 
   const totalPrice =
     parsePriceInput(salePrice) * requestedQuantity;
 
   useEffect(() => {
-    try {
-      localStorage.setItem(SALES_KEY, JSON.stringify(sales));
-    } catch (error) {
-      console.error("Could not save sales:", error);
-    }
-  }, [sales]);
+    const refreshCurrency = () => {
+      const currentShopCurrency = getShopCurrency();
+
+      if (!currentShopCurrency) {
+        setCurrencySettingsNotice(
+          "Shop currency settings are invalid or unavailable. Select the sale currency explicitly and review Workspace settings."
+        );
+        if (!saleCurrencyManuallySelected) {
+          setSaleCurrencyCode("");
+          setCurrencyNeedsReview(true);
+        }
+        return;
+      }
+
+      setCurrencySettingsNotice("");
+      if (
+        !saleCurrencyManuallySelected &&
+        currentShopCurrency !== saleCurrencyCode
+      ) {
+        setSaleCurrencyCode(currentShopCurrency);
+        setCurrencyNeedsReview(true);
+      }
+    };
+
+    const refreshRecords = (event?: StorageEvent) => {
+      if (
+        event &&
+        event.key !== INVENTORY_KEY &&
+        event.key !== SALES_KEY &&
+        event.key !== SETTINGS_STORAGE_KEY &&
+        event.key !== null
+      ) {
+        return;
+      }
+
+      if (!event || event.key === INVENTORY_KEY || event.key === null) {
+        const latestInventory = readStoredArray<DeviceRecord>(INVENTORY_KEY);
+        setInventoryReadState((current) =>
+          latestInventory
+            ? {
+                records:
+                  JSON.stringify(current.records) ===
+                  JSON.stringify(latestInventory.records)
+                    ? current.records
+                    : latestInventory.records,
+                hasValidSnapshot: true,
+                readError: false,
+              }
+            : current.readError
+              ? current
+              : { ...current, readError: true }
+        );
+      }
+
+      if (!event || event.key === SALES_KEY || event.key === null) {
+        const latestSales = readStoredArray<SaleRecord>(SALES_KEY);
+        setSalesReadState((current) =>
+          latestSales
+            ? {
+                records:
+                  JSON.stringify(current.records) ===
+                  JSON.stringify(latestSales.records)
+                    ? current.records
+                    : latestSales.records,
+                hasValidSnapshot: true,
+                readError: false,
+              }
+            : current.readError
+              ? current
+              : { ...current, readError: true }
+        );
+      }
+
+      if (!event || event.key === SETTINGS_STORAGE_KEY || event.key === null) {
+        refreshCurrency();
+      }
+    };
+    const refreshOnFocus = () => refreshRecords();
+
+    window.addEventListener("storage", refreshRecords);
+    window.addEventListener("focus", refreshOnFocus);
+
+    return () => {
+      window.removeEventListener("storage", refreshRecords);
+      window.removeEventListener("focus", refreshOnFocus);
+    };
+  }, [saleCurrencyCode, saleCurrencyManuallySelected]);
 
   const handleCurrencyChange = (newCurrency: string) => {
     setSaleCurrencyCode(newCurrency);
+    setSaleCurrencyManuallySelected(true);
+    setCurrencyNeedsReview(false);
     setSalePrice("");
     setNotice("");
   };
@@ -258,17 +393,27 @@ export default function Sales() {
   const handleItemSelection = (item: DeviceRecord) => {
     setSelectedId(item.id);
 
-    const itemCurrency = getRecordCurrency(item.currencyCode);
+    const itemCurrency = isCurrencyCode(item.currencyCode)
+      ? item.currencyCode
+      : null;
 
     setSalePrice(
-      itemCurrency === saleCurrencyCode
+      itemCurrency === saleCurrencyCode &&
+        getKnownCostAmount(item.sellingPrice) !== null
         ? formatPriceInput(item.sellingPrice ?? "")
         : ""
     );
 
     setQuantity("1");
     setSearch("");
-    setNotice("");
+    setNotice(
+      !itemCurrency
+        ? "This inventory item has no valid saved cost currency. Its sale will be blocked until the cost currency is resolved."
+        : isAccessory(item) &&
+            getKnownStockQuantity(item.quantity) === null
+          ? "This accessory has an invalid saved quantity. Its sale is blocked until inventory is corrected."
+          : ""
+    );
   };
 
   const handleSale = () => {
@@ -288,24 +433,78 @@ export default function Sales() {
     }
 
     if (
-      !Number.isInteger(quantityToSell) ||
+      !Number.isSafeInteger(quantityToSell) ||
       quantityToSell <= 0
     ) {
       setNotice("Enter a valid whole-number quantity.");
       return;
     }
 
-    if (!transactionDate) {
-      setNotice("Please select a transaction date.");
+    if (
+      !transactionDate ||
+      !Number.isFinite(new Date(transactionDate).getTime())
+    ) {
+      setNotice("Enter a valid transaction date and time.");
       return;
     }
 
     if (!saleCurrencyCode) {
-      setNotice("Please select a sale currency.");
+      setNotice(
+        currencySettingsNotice || "Please select a sale currency."
+      );
       return;
     }
 
-    const latestDevices = readInventory();
+    if (!saleCurrencyManuallySelected) {
+      const currentShopCurrency = getShopCurrency();
+
+      if (!currentShopCurrency) {
+        setSaleCurrencyCode("");
+        setCurrencyNeedsReview(true);
+        setNotice(
+          "Shop currency settings are invalid or unavailable. Select the sale currency explicitly before saving."
+        );
+        return;
+      }
+
+      if (currentShopCurrency !== saleCurrencyCode) {
+        setSaleCurrencyCode(currentShopCurrency);
+        setCurrencyNeedsReview(true);
+        setNotice(
+          "Shop currency changed. Review the price and confirm the sale currency before saving."
+        );
+        return;
+      }
+    }
+
+    if (currencyNeedsReview) {
+      setNotice(
+        "Review the sale price and currency, then confirm before recording this sale."
+      );
+      return;
+    }
+
+    const inventorySnapshot = readStoredArray<DeviceRecord>(INVENTORY_KEY);
+    const salesSnapshot = readStoredArray<SaleRecord>(SALES_KEY);
+
+    if (!inventorySnapshot || !salesSnapshot) {
+      if (!inventorySnapshot) {
+        setInventoryReadState((current) =>
+          current.readError ? current : { ...current, readError: true }
+        );
+      }
+      if (!salesSnapshot) {
+        setSalesReadState((current) =>
+          current.readError ? current : { ...current, readError: true }
+        );
+      }
+      setNotice(
+        "Could not safely read saved inventory or sales. No changes were made. Check browser storage before trying again."
+      );
+      return;
+    }
+
+    const latestDevices = inventorySnapshot.records;
 
     const latestItem = latestDevices.find(
       (item) => item.id === selectedId
@@ -318,10 +517,25 @@ export default function Sales() {
       return;
     }
 
+    const itemCostCurrency = latestItem.currencyCode;
+    if (!isCurrencyCode(itemCostCurrency)) {
+      setNotice(
+        "This inventory item has no valid saved cost currency. No sale was recorded; resolve the item's cost currency before selling it."
+      );
+      return;
+    }
+
     const accessory = isAccessory(latestItem);
     const latestAvailableQuantity = accessory
-      ? Math.max(0, Number(latestItem.quantity) || 0)
+      ? getKnownStockQuantity(latestItem.quantity)
       : 1;
+
+    if (latestAvailableQuantity === null) {
+      setNotice(
+        "This accessory has an invalid saved quantity. No sale was recorded; correct the inventory quantity first."
+      );
+      return;
+    }
 
     if (accessory && quantityToSell > latestAvailableQuantity) {
       setNotice(
@@ -335,9 +549,24 @@ export default function Sales() {
       return;
     }
 
-    const unitCost = Number(latestItem.costPrice) || 0;
+    const unitCost = getKnownCostAmount(latestItem.costPrice);
     const saleTotal = price * quantityToSell;
-    const costTotal = unitCost * quantityToSell;
+    const costTotal =
+      unitCost === null ? null : unitCost * quantityToSell;
+
+    if (getKnownSaleAmount(saleTotal) === null) {
+      setNotice(
+        "The sale total is outside the supported numeric range. No sale was recorded."
+      );
+      return;
+    }
+
+    if (costTotal !== null && !Number.isFinite(costTotal)) {
+      setNotice(
+        "The inventory cost is outside the supported numeric range. No sale was recorded."
+      );
+      return;
+    }
 
     const sale: SaleRecord = {
       id: crypto.randomUUID(),
@@ -352,7 +581,7 @@ export default function Sales() {
       quantitySold: accessory ? quantityToSell : 1,
       unitPrice: price,
       currencyCode: saleCurrencyCode,
-      costCurrencyCode: getRecordCurrency(latestItem.currencyCode),
+      costCurrencyCode: itemCostCurrency,
     };
 
     const updatedDevices = latestDevices.map((item) => {
@@ -362,7 +591,7 @@ export default function Sales() {
 
       if (accessory) {
         const remainingQuantity =
-          Math.max(0, Number(item.quantity) || 0) - quantityToSell;
+          (getKnownStockQuantity(item.quantity) ?? 0) - quantityToSell;
 
         return {
           ...item,
@@ -382,26 +611,55 @@ export default function Sales() {
       };
     });
 
-    const previousInventoryRaw =
-      localStorage.getItem(INVENTORY_KEY);
-    const previousSalesRaw =
-      localStorage.getItem(SALES_KEY);
-
-    const updatedSales = [sale, ...readSales()];
+    const updatedSales = [sale, ...salesSnapshot.records];
+    const updatedInventoryRaw = JSON.stringify(updatedDevices);
+    const updatedSalesRaw = JSON.stringify(updatedSales);
+    let inventoryWritten = false;
+    let salesWritten = false;
 
     try {
-      localStorage.setItem(
-        INVENTORY_KEY,
-        JSON.stringify(updatedDevices)
-      );
+      if (
+        localStorage.getItem(INVENTORY_KEY) !== inventorySnapshot.raw ||
+        localStorage.getItem(SALES_KEY) !== salesSnapshot.raw
+      ) {
+        const currentInventory = readStoredArray<DeviceRecord>(INVENTORY_KEY);
+        const currentSales = readStoredArray<SaleRecord>(SALES_KEY);
 
-      localStorage.setItem(
-        SALES_KEY,
-        JSON.stringify(updatedSales)
-      );
+        setInventoryReadState((current) =>
+          currentInventory
+            ? toStoredArrayReadState(currentInventory)
+            : current.readError
+              ? current
+              : { ...current, readError: true }
+        );
+        setSalesReadState((current) =>
+          currentSales
+            ? toStoredArrayReadState(currentSales)
+            : current.readError
+              ? current
+              : { ...current, readError: true }
+        );
 
-      setDevices(updatedDevices);
-      setSales(updatedSales);
+        setNotice(
+          "Inventory or sales changed in another tab. The latest records were loaded; review and try again."
+        );
+        return;
+      }
+
+      localStorage.setItem(INVENTORY_KEY, updatedInventoryRaw);
+      inventoryWritten = true;
+
+      localStorage.setItem(SALES_KEY, updatedSalesRaw);
+      salesWritten = true;
+
+      setInventoryReadState(toStoredArrayReadState({
+        raw: updatedInventoryRaw,
+        records: updatedDevices,
+      }));
+      setSalesReadState(toStoredArrayReadState({
+        raw: updatedSalesRaw,
+        records: updatedSales,
+      }));
 
       setSelectedId("");
       setSalePrice("");
@@ -410,33 +668,60 @@ export default function Sales() {
     } catch (error) {
       console.error("Could not save sale:", error);
 
-      let rollbackSucceeded = true;
+      const restoreValue = (
+        key: string,
+        previousRaw: string | null,
+        writtenRaw: string,
+        wasWritten: boolean,
+      ) => {
+        if (!wasWritten) return true;
 
-      try {
-        if (previousInventoryRaw === null) {
-          localStorage.removeItem(INVENTORY_KEY);
-        } else {
-          localStorage.setItem(
-            INVENTORY_KEY,
-            previousInventoryRaw
-          );
-        }
+        try {
+          if (localStorage.getItem(key) !== writtenRaw) return false;
 
-        if (previousSalesRaw === null) {
-          localStorage.removeItem(SALES_KEY);
-        } else {
-          localStorage.setItem(
-            SALES_KEY,
-            previousSalesRaw
-          );
+          if (previousRaw === null) {
+            localStorage.removeItem(key);
+          } else {
+            localStorage.setItem(key, previousRaw);
+          }
+
+          return true;
+        } catch (rollbackError) {
+          console.error(`Could not restore ${key} after a failed sale:`, rollbackError);
+          return false;
         }
-      } catch (rollbackError) {
-        rollbackSucceeded = false;
-        console.error(
-          "Could not roll back failed sale:",
-          rollbackError
-        );
-      }
+      };
+
+      const salesRestored = restoreValue(
+        SALES_KEY,
+        salesSnapshot.raw,
+        updatedSalesRaw,
+        salesWritten,
+      );
+      const inventoryRestored = restoreValue(
+        INVENTORY_KEY,
+        inventorySnapshot.raw,
+        updatedInventoryRaw,
+        inventoryWritten,
+      );
+      const rollbackSucceeded = salesRestored && inventoryRestored;
+
+      const currentInventory = readStoredArray<DeviceRecord>(INVENTORY_KEY);
+      const currentSales = readStoredArray<SaleRecord>(SALES_KEY);
+      setInventoryReadState((current) =>
+        currentInventory
+          ? toStoredArrayReadState(currentInventory)
+          : current.readError
+            ? current
+            : { ...current, readError: true }
+      );
+      setSalesReadState((current) =>
+        currentSales
+          ? toStoredArrayReadState(currentSales)
+          : current.readError
+            ? current
+            : { ...current, readError: true }
+      );
 
       setNotice(
         rollbackSucceeded
@@ -463,6 +748,26 @@ export default function Sales() {
           <ShoppingCart size={22} />
         </div>
       </div>
+
+      {(inventoryReadState.readError || salesReadState.readError) && (
+        <div
+          className="operations-notice"
+          style={{ color: "#f87171", fontSize: 13 }}
+          role="alert"
+        >
+          <XCircle size={15} />
+          <span>
+            {inventoryReadState.readError &&
+              (inventoryReadState.hasValidSnapshot
+                ? "Could not refresh inventory. Showing the last successfully loaded stock; current availability may be out of date. "
+                : "Inventory data is unavailable because browser storage could not be read. ")}
+            {salesReadState.readError &&
+              (salesReadState.hasValidSnapshot
+                ? "Could not refresh sales history. Showing the last successfully loaded records; current history may be out of date."
+                : "Sales history is unavailable because browser storage could not be read.")}
+          </span>
+        </div>
+      )}
 
       <div className="operations-grid">
         <section className="surface-card operations-form-card">
@@ -614,11 +919,12 @@ export default function Sales() {
                 Type any part of the brand, model, SKU or identifier to see matching stock.
               </small>
 
-              {availableItems.length === 0 && (
-                <small className="field-hint">
-                  No available items. Receive stock into Inventory first.
-                </small>
-              )}
+              {inventoryReadState.hasValidSnapshot &&
+                availableItems.length === 0 && (
+                  <small className="field-hint">
+                    No available items. Receive stock into Inventory first.
+                  </small>
+                )}
             </div>
 
             {selectedItem && (
@@ -634,7 +940,7 @@ export default function Sales() {
                   </strong>
                   <p>{selectedItem.identifier}</p>
                   <p>
-                    Original purchase currency: {purchaseCurrency}
+                    Original purchase currency: {purchaseCurrency || "Currency unavailable"}
                   </p>
                   <p>
                     Customer sale currency: {saleCurrencyCode}
@@ -672,12 +978,32 @@ export default function Sales() {
                   handleCurrencyChange(event.target.value)
                 }
               >
+                <option value="" disabled>
+                  Select a currency
+                </option>
                 {CURRENCY_OPTIONS.map((currency) => (
                   <option key={currency.code} value={currency.code}>
                     {currency.code}
                   </option>
                 ))}
               </select>
+              {currencySettingsNotice && (
+                <small className="field-hint" role="status">
+                  {currencySettingsNotice}
+                </small>
+              )}
+              {currencyNeedsReview && (
+                <small className="field-hint" role="status">
+                  Shop currency changed. Review the entered sale price, then
+                  <button
+                    className="button button-secondary"
+                    type="button"
+                    onClick={() => setCurrencyNeedsReview(false)}
+                  >
+                    confirm this currency
+                  </button>
+                </small>
+              )}
               <small className="field-hint">
                 Choose the currency the customer will actually pay in.
                 This can differ from the purchase currency.
@@ -687,8 +1013,8 @@ export default function Sales() {
             <label className="inventory-field">
               <span>
                 {selectedIsAccessory
-                  ? `Selling price per unit (${saleCurrencyCode})`
-                  : `Selling price (${saleCurrencyCode})`}
+                  ? `Selling price per unit (${saleCurrencyCode || "select currency"})`
+                  : `Selling price (${saleCurrencyCode || "select currency"})`}
               </span>
               <input
                 ref={priceInputRef}
@@ -706,7 +1032,11 @@ export default function Sales() {
                 <Receipt size={18} />
                 <div>
                   <strong>Transaction total</strong>
-                  <p>{formatCurrency(totalPrice, saleCurrencyCode)}</p>
+                  <p>
+                    {saleCurrencyCode
+                      ? formatCurrency(totalPrice, saleCurrencyCode)
+                      : "Select a sale currency"}
+                  </p>
                 </div>
               </div>
             )}
@@ -716,14 +1046,19 @@ export default function Sales() {
               <select
                 value={paymentMethod}
                 onChange={(event) =>
-                  setPaymentMethod(event.target.value as PaymentMethod)
+                  setPaymentMethod(
+                    getKnownPaymentMethod(event.target.value) ?? "Cash"
+                  )
                 }
               >
-                <option>Cash</option>
-                <option>MTN Mobile Money</option>
-                <option>Airtel Money</option>
-                <option>Bank Transfer</option>
+                {PAYMENT_METHODS.map((method) => (
+                  <option key={method}>{method}</option>
+                ))}
               </select>
+              <small className="field-hint">
+                This method applies to the full sale amount. Partial customer
+                payments are not supported.
+              </small>
             </label>
 
             <label className="inventory-field">
@@ -771,19 +1106,37 @@ export default function Sales() {
               <div className="card-kicker">SALES REGISTER</div>
               <h2>Recent transactions</h2>
             </div>
-            <span className="inventory-count">{sales.length} sales</span>
+            <span className="inventory-count">
+              {salesReadState.hasValidSnapshot ? `${sales.length} sales` : "Sales unavailable"}
+            </span>
           </div>
 
-          {sales.length === 0 ? (
+          {!salesReadState.hasValidSnapshot ? (
             <div className="inventory-empty">
               <Receipt size={24} />
-              <strong>No sales recorded yet</strong>
-              <span>Your completed transactions will appear here.</span>
+              <strong>Sales history unavailable</strong>
+              <span>Browser storage could not be read, so sales records cannot be verified.</span>
+            </div>
+          ) : sales.length === 0 ? (
+            <div className="inventory-empty">
+              <Receipt size={24} />
+              <strong>
+                {salesReadState.readError
+                  ? "No sales were present in the last successful read"
+                  : "No sales recorded yet"}
+              </strong>
+              <span>
+                {salesReadState.readError
+                  ? "The latest sales history could not be verified."
+                  : "Your completed transactions will appear here."}
+              </span>
             </div>
           ) : (
             <div className="operations-record-list">
               {sales.map((sale) => {
-                const currencyCode = getRecordCurrency(sale.currencyCode);
+                const costCurrencyCode = getKnownRecordCurrency(
+                  sale.costCurrencyCode
+                );
 
                 return (
                   <article className="operations-record" key={sale.id}>
@@ -808,14 +1161,17 @@ export default function Sales() {
                       <span>
                         {sale.paymentMethod} · {sale.id}
                       </span>
-                      {sale.costCurrencyCode && (
+                      {sale.costPrice == null ? (
+                        <span>Original cost: unavailable</span>
+                      ) : (
                         <span>
-                          Original cost currency: {sale.costCurrencyCode}
+                          Original cost currency:{" "}
+                          {costCurrencyCode ?? "Currency unavailable"}
                         </span>
                       )}
                     </div>
                     <strong className="operations-amount">
-                      {formatCurrency(sale.salePrice, currencyCode)}
+                      {formatSaleAmount(sale)}
                     </strong>
                   </article>
                 );

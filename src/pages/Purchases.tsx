@@ -11,8 +11,14 @@ import CurrencyInput from "../components/CurrencyInput";
 import {
   CURRENCY_OPTIONS,
   formatCurrency,
-  getRecordCurrency,
+  getKnownCostAmount,
+  getKnownNonNegativeAmount,
+  getKnownOutstandingBalance,
+  getKnownRecordCurrency,
+  getKnownStockQuantity,
   getShopCurrency,
+  isCurrencyCode,
+  SETTINGS_STORAGE_KEY,
   type CurrencyCode,
 } from "../utils/currency";
 
@@ -85,7 +91,7 @@ type CreditRecord = {
   originalAmount: number;
   dueDate: string;
   createdAt: string;
-  payments: CreditPayment[];
+  payments?: CreditPayment[];
   purchaseId?: string;
   currencyCode?: CurrencyCode;
 };
@@ -108,57 +114,167 @@ const emptyItem = {
   identifiers: "",
 };
 
-function readStorage<T>(key: string, fallback: T): T {
+function normalizeIdentifier(value: unknown): string {
+  return typeof value === "string"
+    ? value.normalize("NFKC").trim().toUpperCase()
+    : "";
+}
+
+type StoredArraySnapshot<T> = {
+  raw: string | null;
+  records: T[];
+};
+
+type StoredArrayReadState<T> = {
+  records: T[];
+  hasValidSnapshot: boolean;
+  readError: boolean;
+};
+
+function readStoredArray<T>(key: string): StoredArraySnapshot<T> | null {
   try {
-    const saved = localStorage.getItem(key);
-    return saved ? (JSON.parse(saved) as T) : fallback;
+    const raw = localStorage.getItem(key);
+
+    if (raw === null) return { raw, records: [] };
+
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+
+    return { raw, records: parsed as T[] };
   } catch {
-    return fallback;
+    return null;
   }
 }
 
-function saveStorage<T>(key: string, value: T) {
-  localStorage.setItem(key, JSON.stringify(value));
+function isCreditPayment(value: unknown): value is CreditPayment {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value)
+  ) {
+    return false;
+  }
+
+  const payment = value as Record<string, unknown>;
+  return (
+    typeof payment.id === "string" &&
+    typeof payment.amount === "number" &&
+    Number.isFinite(payment.amount) &&
+    payment.amount >= 0 &&
+    typeof payment.date === "string"
+  );
+}
+
+function readCreditSnapshot(): StoredArraySnapshot<CreditRecord> | null {
+  const snapshot = readStoredArray<unknown>(CREDIT_KEY);
+  if (!snapshot) return null;
+
+  const records: CreditRecord[] = [];
+  for (const value of snapshot.records) {
+    if (
+      value === null ||
+      typeof value !== "object" ||
+      Array.isArray(value)
+    ) {
+      return null;
+    }
+
+    const record = value as Record<string, unknown>;
+    const hasPayments = Object.prototype.hasOwnProperty.call(
+      record,
+      "payments"
+    );
+
+    if (
+      hasPayments &&
+      (!Array.isArray(record.payments) ||
+        !record.payments.every(isCreditPayment))
+    ) {
+      return null;
+    }
+
+    records.push(record as CreditRecord);
+  }
+
+  return { ...snapshot, records };
+}
+
+function toStoredArrayReadState<T>(
+  snapshot: StoredArraySnapshot<T> | null
+): StoredArrayReadState<T> {
+  return {
+    records: snapshot?.records ?? [],
+    hasValidSnapshot: snapshot !== null,
+    readError: snapshot === null,
+  };
 }
 
 type StorageEntry = {
   key: string;
   value: unknown;
+  expectedRaw: string | null;
 };
 
 function saveStorageBatch(entries: StorageEntry[]) {
   const previousValues = new Map<string, string | null>();
+  const serializedValues = new Map<string, string>();
 
-  // Capture the existing values before changing anything.
+  // Refuse the write if any key changed after the caller read its snapshot.
   try {
     for (const entry of entries) {
-      previousValues.set(entry.key, localStorage.getItem(entry.key));
+      const currentValue = localStorage.getItem(entry.key);
+
+      if (currentValue !== entry.expectedRaw) {
+        return {
+          success: false,
+          rollbackSucceeded: true,
+          conflict: true,
+        };
+      }
+
+      previousValues.set(entry.key, currentValue);
+      const serializedValue = JSON.stringify(entry.value);
+      if (typeof serializedValue !== "string") {
+        throw new Error(`Could not serialize ${entry.key}.`);
+      }
+      serializedValues.set(entry.key, serializedValue);
     }
   } catch {
     return {
       success: false,
       rollbackSucceeded: true,
+      conflict: false,
     };
   }
 
-  // Attempt to save every record.
+  const writtenEntries: StorageEntry[] = [];
+
+  // Attempt each write, keeping enough information for a cautious rollback.
   try {
     for (const entry of entries) {
-      localStorage.setItem(entry.key, JSON.stringify(entry.value));
+      localStorage.setItem(entry.key, serializedValues.get(entry.key)!);
+      writtenEntries.push(entry);
     }
 
     return {
       success: true,
       rollbackSucceeded: true,
+      conflict: false,
     };
   } catch {
-    // If a save fails, attempt to restore all previous values.
+    // Restore only values written here, and do not replace a newer tab's value.
     let rollbackSucceeded = true;
 
-    const previousEntries = Array.from(previousValues.entries()).reverse();
-
-    for (const [key, previousValue] of previousEntries) {
+    for (const entry of writtenEntries.reverse()) {
       try {
+        const key = entry.key;
+        const previousValue = previousValues.get(key) ?? null;
+
+        if (localStorage.getItem(key) !== serializedValues.get(key)) {
+          rollbackSucceeded = false;
+          continue;
+        }
+
         if (previousValue === null) {
           localStorage.removeItem(key);
         } else {
@@ -172,14 +288,19 @@ function saveStorageBatch(entries: StorageEntry[]) {
     return {
       success: false,
       rollbackSucceeded,
+      conflict: false,
     };
   }
 }
 
 export default function Purchases() {
-  const [purchases, setPurchases] = useState<PurchaseRecord[]>(() =>
-    readStorage(PURCHASES_KEY, [])
+  const [purchaseReadState, setPurchaseReadState] = useState(() =>
+    toStoredArrayReadState(readStoredArray<PurchaseRecord>(PURCHASES_KEY))
   );
+  const [creditReadState, setCreditReadState] = useState(() =>
+    toStoredArrayReadState(readCreditSnapshot())
+  );
+  const purchases = purchaseReadState.records;
 
   const [itemForm, setItemForm] = useState(emptyItem);
   const [items, setItems] = useState<PurchaseItem[]>([]);
@@ -192,28 +313,103 @@ export default function Purchases() {
   const [dueDate, setDueDate] = useState("");
   const [initialPayment, setInitialPayment] = useState("0");
   const [invoiceCurrency, setInvoiceCurrency] = useState<CurrencyCode>(
-    () => getShopCurrency()
+    () => getShopCurrency() ?? ""
+  );
+  const [invoiceCurrencyManuallySelected, setInvoiceCurrencyManuallySelected] =
+    useState(false);
+  const [invoiceCurrencyNeedsReview, setInvoiceCurrencyNeedsReview] =
+    useState(false);
+  const [currencySettingsNotice, setCurrencySettingsNotice] = useState(() =>
+    getShopCurrency()
+      ? ""
+      : "Shop currency settings are invalid or unavailable. Select the invoice currency explicitly and review Workspace settings."
   );
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
   useEffect(() => {
-    saveStorage(PURCHASES_KEY, purchases);
-  }, [purchases]);
-
-  useEffect(() => {
-    const refresh = () => {
-      setPurchases(readStorage(PURCHASES_KEY, []));
+    const refreshCurrency = () => {
+      const currentShopCurrency = getShopCurrency();
+      setCurrencySettingsNotice(
+        currentShopCurrency
+          ? ""
+          : "Shop currency settings are invalid or unavailable. Select the invoice currency explicitly and review Workspace settings."
+      );
+      if (!invoiceCurrencyManuallySelected) {
+        if (!currentShopCurrency) {
+          setInvoiceCurrency("");
+          setInvoiceCurrencyNeedsReview(true);
+        } else if (currentShopCurrency !== invoiceCurrency) {
+          setInvoiceCurrency(currentShopCurrency);
+          setInvoiceCurrencyNeedsReview(true);
+        }
+      }
     };
 
-    window.addEventListener("focus", refresh);
+    const refresh = (event?: StorageEvent) => {
+      if (
+        event &&
+        event.key !== PURCHASES_KEY &&
+        event.key !== CREDIT_KEY &&
+        event.key !== SETTINGS_STORAGE_KEY &&
+        event.key !== null
+      ) {
+        return;
+      }
+
+      if (
+        !event ||
+        event.key === PURCHASES_KEY ||
+        event.key === CREDIT_KEY ||
+        event.key === null
+      ) {
+        const latest = readStoredArray<PurchaseRecord>(PURCHASES_KEY);
+        setPurchaseReadState((current) =>
+          latest
+            ? {
+                records:
+                  JSON.stringify(current.records) ===
+                  JSON.stringify(latest.records)
+                    ? current.records
+                    : latest.records,
+                hasValidSnapshot: true,
+                readError: false,
+              }
+            : current.readError
+              ? current
+              : { ...current, readError: true }
+        );
+      }
+
+      if (!event || event.key === CREDIT_KEY || event.key === null) {
+        const latestCredits = readCreditSnapshot();
+        setCreditReadState((current) =>
+          latestCredits
+            ? {
+                records: latestCredits.records,
+                hasValidSnapshot: true,
+                readError: false,
+              }
+            : current.readError
+              ? current
+              : { ...current, readError: true }
+        );
+      }
+
+      if (!event || event.key === SETTINGS_STORAGE_KEY || event.key === null) {
+        refreshCurrency();
+      }
+    };
+    const refreshOnFocus = () => refresh();
+
+    window.addEventListener("focus", refreshOnFocus);
     window.addEventListener("storage", refresh);
 
     return () => {
-      window.removeEventListener("focus", refresh);
+      window.removeEventListener("focus", refreshOnFocus);
       window.removeEventListener("storage", refresh);
     };
-  }, []);
+  }, [invoiceCurrency, invoiceCurrencyManuallySelected]);
 
   const purchaseTotal = useMemo(
     () => items.reduce((sum, item) => sum + item.quantity * item.unitCost, 0),
@@ -228,11 +424,25 @@ export default function Purchases() {
     (purchase) => purchase.status === "Draft"
   ).length;
 
-  const selectedCurrency = getRecordCurrency(invoiceCurrency);
+  const selectedCurrency = getKnownRecordCurrency(invoiceCurrency) ?? "";
 
   const addItem = () => {
     setError("");
     setMessage("");
+
+    if (invoiceCurrencyNeedsReview) {
+      setError(
+        "Review the invoice currency and entered amounts, then confirm before adding products."
+      );
+      return;
+    }
+
+    if (!selectedCurrency) {
+      setError(
+        currencySettingsNotice || "Select an invoice currency before adding products."
+      );
+      return;
+    }
 
     const quantity = Number(itemForm.quantity);
     const unitCost = Number(itemForm.unitCost);
@@ -243,7 +453,7 @@ export default function Purchases() {
       return;
     }
 
-    if (!Number.isInteger(quantity) || quantity < 1) {
+    if (!Number.isSafeInteger(quantity) || quantity < 1) {
       setError("Quantity must be a whole number greater than zero.");
       return;
     }
@@ -255,6 +465,17 @@ export default function Purchases() {
 
     if (!Number.isFinite(sellingPrice) || sellingPrice < 0) {
       setError("Enter a valid selling price.");
+      return;
+    }
+
+    const lineTotal = quantity * unitCost;
+    const updatedTotal =
+      items.reduce((sum, item) => sum + item.quantity * item.unitCost, 0) +
+      lineTotal;
+    if (!Number.isFinite(lineTotal) || !Number.isFinite(updatedTotal)) {
+      setError(
+        "The purchase total is outside the supported numeric range. Reduce the quantity or unit cost."
+      );
       return;
     }
 
@@ -322,6 +543,42 @@ export default function Purchases() {
     setError("");
     setMessage("");
 
+    if (!invoiceCurrencyManuallySelected) {
+      const currentShopCurrency = getShopCurrency();
+
+      if (!currentShopCurrency) {
+        setInvoiceCurrency("");
+        setInvoiceCurrencyNeedsReview(true);
+        setError(
+          "Shop currency settings are invalid or unavailable. Select the invoice currency explicitly before saving."
+        );
+        return;
+      }
+
+      if (currentShopCurrency !== invoiceCurrency) {
+        setInvoiceCurrency(currentShopCurrency);
+        setInvoiceCurrencyNeedsReview(true);
+        setError(
+          "Shop currency changed. Review the invoice amounts and confirm the currency before saving."
+        );
+        return;
+      }
+    }
+
+    if (invoiceCurrencyNeedsReview) {
+      setError(
+        "Review the invoice currency and entered amounts, then confirm before saving the draft."
+      );
+      return;
+    }
+
+    if (!selectedCurrency) {
+      setError(
+        currencySettingsNotice || "Select an invoice currency before saving the draft."
+      );
+      return;
+    }
+
     if (!supplier.trim()) {
       setError("Enter the supplier name.");
       return;
@@ -329,6 +586,13 @@ export default function Purchases() {
 
     if (items.length === 0) {
       setError("Add at least one product to the purchase.");
+      return;
+    }
+
+    if (!Number.isFinite(purchaseTotal) || purchaseTotal <= 0) {
+      setError(
+        "The purchase total is invalid or outside the supported numeric range."
+      );
       return;
     }
 
@@ -354,7 +618,51 @@ export default function Purchases() {
       currencyCode: selectedCurrency,
     };
 
-    setPurchases((current) => [purchase, ...current]);
+    const latestPurchases = readStoredArray<PurchaseRecord>(PURCHASES_KEY);
+
+    if (!latestPurchases) {
+      setPurchaseReadState((current) =>
+        current.readError ? current : { ...current, readError: true }
+      );
+      setError(
+        "Could not safely read purchase history. No draft was saved; check browser storage before trying again."
+      );
+      return;
+    }
+
+    const updatedPurchases = [purchase, ...latestPurchases.records];
+    const saveResult = saveStorageBatch([
+      {
+        key: PURCHASES_KEY,
+        value: updatedPurchases,
+        expectedRaw: latestPurchases.raw,
+      },
+    ]);
+
+    if (!saveResult.success) {
+      if (saveResult.conflict) {
+        const currentPurchases = readStoredArray<PurchaseRecord>(PURCHASES_KEY);
+        if (currentPurchases) {
+          setPurchaseReadState(toStoredArrayReadState(currentPurchases));
+        } else {
+          setPurchaseReadState((current) =>
+            current.readError ? current : { ...current, readError: true }
+          );
+        }
+        setError(
+          "Purchase history changed in another tab. The latest records were loaded; review and try again."
+        );
+      } else {
+        setError("Could not save the purchase draft. No changes were made.");
+      }
+      return;
+    }
+
+    setPurchaseReadState({
+      records: updatedPurchases,
+      hasValidSnapshot: true,
+      readError: false,
+    });
 
     setSupplier("");
     setSupplierContact("");
@@ -363,7 +671,14 @@ export default function Purchases() {
     setDueDate("");
     setInitialPayment("0");
     setItems([]);
-    setInvoiceCurrency(getShopCurrency());
+    setInvoiceCurrency(getShopCurrency() ?? "");
+    setInvoiceCurrencyManuallySelected(false);
+    setInvoiceCurrencyNeedsReview(false);
+    setCurrencySettingsNotice(
+      getShopCurrency()
+        ? ""
+        : "Shop currency settings are invalid or unavailable. Select the invoice currency explicitly and review Workspace settings."
+    );
 
     setMessage(
       `Purchase draft saved in ${selectedCurrency}. Inventory has not been changed.`
@@ -375,39 +690,223 @@ export default function Purchases() {
     setError("");
     setMessage("");
 
-    if (purchase.status === "Received") {
+    const latestPurchases = readStoredArray<PurchaseRecord>(PURCHASES_KEY);
+    const inventorySnapshot = readStoredArray<InventoryRecord>(INVENTORY_KEY);
+    const creditSnapshot = readCreditSnapshot();
+
+    if (!latestPurchases || !inventorySnapshot || !creditSnapshot) {
+      if (!latestPurchases) {
+        setPurchaseReadState((current) =>
+          current.readError ? current : { ...current, readError: true }
+        );
+      }
+      if (!creditSnapshot) {
+        setCreditReadState((current) =>
+          current.readError ? current : { ...current, readError: true }
+        );
+      }
+      setError(
+        "Could not safely read purchase, inventory, or credit records. No changes were made; check browser storage before trying again."
+      );
+      return;
+    }
+
+    const currentPurchase = latestPurchases.records.find(
+      (record) => record.id === purchase.id
+    );
+
+    if (!currentPurchase) {
+      setPurchaseReadState(toStoredArrayReadState(latestPurchases));
+      setError("This purchase is no longer in the latest purchase history.");
+      return;
+    }
+
+    if (currentPurchase.status === "Received") {
+      setPurchaseReadState(toStoredArrayReadState(latestPurchases));
       setError("This purchase has already been received.");
       return;
     }
 
-    const purchaseCurrency = getRecordCurrency(purchase.currencyCode);
+    if (currentPurchase.status !== "Draft") {
+      setError(
+        "Cannot receive this purchase because its saved status is invalid. No records were changed."
+      );
+      return;
+    }
 
-    const inventory = readStorage<InventoryRecord[]>(INVENTORY_KEY, []);
-    const credits = readStorage<CreditRecord[]>(CREDIT_KEY, []);
+    if (typeof currentPurchase.supplier !== "string" ||
+      !currentPurchase.supplier.trim()) {
+      setError(
+        "Cannot receive this purchase because its supplier name is missing or invalid. No records were changed."
+      );
+      return;
+    }
+
+    if (!isCurrencyCode(currentPurchase.currencyCode)) {
+      setError(
+        "Cannot receive this purchase because its saved invoice currency is missing or invalid. No inventory or supplier credit was changed; review the purchase currency before receiving it."
+      );
+      return;
+    }
+
+    if (
+      !Array.isArray(currentPurchase.items) ||
+      currentPurchase.items.length === 0
+    ) {
+      setError(
+        "Cannot receive this purchase because its saved item list is missing or invalid. No records were changed."
+      );
+      return;
+    }
+
+    const validPurchaseTotal = getKnownNonNegativeAmount(currentPurchase.total);
+    const validInitialPayment = getKnownNonNegativeAmount(
+      currentPurchase.initialPayment
+    );
+    let calculatedPurchaseTotal = 0;
+    for (const item of currentPurchase.items) {
+      if (!item || typeof item !== "object") {
+        setError(
+          "Cannot receive this purchase because one or more saved item records are invalid. No inventory or supplier credit was changed."
+        );
+        return;
+      }
+      const quantity = getKnownStockQuantity(item?.quantity);
+      const unitCost = getKnownNonNegativeAmount(item.unitCost);
+      const savedSellingPrice = getKnownNonNegativeAmount(item.sellingPrice);
+      if (
+        (item.category !== "Device" &&
+          item.category !== "Accessory / spare part") ||
+        typeof item.brand !== "string" ||
+        !item.brand.trim() ||
+        typeof item.model !== "string" ||
+        !item.model.trim() ||
+        !Array.isArray(item.identifiers) ||
+        !item.identifiers.every(
+          (identifier) =>
+            typeof identifier === "string" && identifier.trim().length > 0
+        ) ||
+        quantity === null ||
+        quantity <= 0 ||
+        unitCost === null ||
+        unitCost <= 0 ||
+        savedSellingPrice === null ||
+        !Number.isFinite(unitCost * quantity)
+      ) {
+        setError(
+          "Cannot receive this purchase because one or more saved item quantities or amounts are invalid. No inventory or supplier credit was changed."
+        );
+        return;
+      }
+
+      if (
+        item.category === "Accessory / spare part" &&
+        item.identifiers.length > 1
+      ) {
+        setError(
+          "Cannot receive this purchase because an accessory line has multiple identifiers. No records were changed."
+        );
+        return;
+      }
+
+      calculatedPurchaseTotal +=
+        unitCost * quantity;
+      if (!Number.isFinite(calculatedPurchaseTotal)) {
+        setError(
+          "Cannot receive this purchase because its total is outside the supported numeric range. No records were changed."
+        );
+        return;
+      }
+    }
+
+    if (
+      validPurchaseTotal === null ||
+      validInitialPayment === null ||
+      validPurchaseTotal !== calculatedPurchaseTotal ||
+      validInitialPayment > validPurchaseTotal
+    ) {
+      setError(
+        "Cannot receive this purchase because its saved total or initial payment does not match the validated item amounts. No records were changed."
+      );
+      return;
+    }
+
+    const purchaseCurrency = currentPurchase.currencyCode;
+
+    const inventory = inventorySnapshot.records;
+    const credits = creditSnapshot.records;
     const updatedInventory = [...inventory];
+    let accessoryLinesSeparatedForUnknownStockData = 0;
 
-    // Check every device identifier before changing inventory.
-    for (const item of purchase.items) {
+    const existingIdentifiers = new Set<string>();
+    for (const record of inventory) {
+      const savedIdentifiers = [
+        record.identifier,
+        ...(Array.isArray(record.secondaryIdentifiers)
+          ? record.secondaryIdentifiers
+          : []),
+      ];
+
+      for (const identifier of savedIdentifiers) {
+        const normalized = normalizeIdentifier(identifier);
+        if (normalized) existingIdentifiers.add(normalized);
+      }
+    }
+
+    const incomingIdentifiers = new Set<string>();
+
+    // Validate all device identifiers before preparing any receipt changes.
+    for (const item of currentPurchase.items) {
       if (item.category === "Device") {
-        for (const identifier of item.identifiers) {
-          const duplicate = updatedInventory.some(
-            (record) =>
-              record.identifier === identifier ||
-              record.secondaryIdentifiers?.includes(identifier)
+        if (!Array.isArray(item.identifiers) || item.identifiers.length === 0) {
+          setError(
+            `Cannot receive this purchase because device line ${item.brand} ${item.model} has no identifiers. No stock was added.`
           );
+          return;
+        }
 
-          if (duplicate) {
+        if (
+          !Number.isSafeInteger(item.quantity) ||
+          item.quantity < 1 ||
+          item.identifiers.length !== item.quantity
+        ) {
+          setError(
+            `Cannot receive this purchase because device line ${item.brand} ${item.model} requires ${item.quantity} identifier(s), but has ${item.identifiers.length}. No stock was added.`
+          );
+          return;
+        }
+
+        for (const identifier of item.identifiers) {
+          const normalized = normalizeIdentifier(identifier);
+
+          if (!normalized) {
             setError(
-              `Cannot receive this purchase: identifier ${identifier} already exists in inventory. No stock was added.`
+              "Cannot receive this purchase because a device line has an empty identifier. No stock was added."
             );
             return;
           }
+
+          if (existingIdentifiers.has(normalized)) {
+            setError(
+              `Cannot receive this purchase: identifier "${identifier}" already exists in inventory. No stock was added.`
+            );
+            return;
+          }
+
+          if (incomingIdentifiers.has(normalized)) {
+            setError(
+              `Cannot receive this purchase: identifier "${identifier}" appears more than once across its device lines. No stock was added.`
+            );
+            return;
+          }
+
+          incomingIdentifiers.add(normalized);
         }
       }
     }
 
     const alreadyLinked = credits.some(
-      (credit) => credit.purchaseId === purchase.id
+      (credit) => credit.purchaseId === currentPurchase.id
     );
 
     if (alreadyLinked) {
@@ -418,7 +917,7 @@ export default function Purchases() {
     }
 
     // Prepare inventory changes without saving them yet.
-    for (const item of purchase.items) {
+    for (const item of currentPurchase.items) {
       if (item.category === "Device") {
         for (const identifier of item.identifiers) {
           updatedInventory.push({
@@ -443,59 +942,98 @@ export default function Purchases() {
       } else {
         const sku = item.identifiers[0] || item.model;
 
-        const existingIndex = updatedInventory.findIndex((record) => {
-          const recordCurrency = getRecordCurrency(record.currencyCode);
+        const matchesAccessory = (record: InventoryRecord) =>
+          record.category === "Accessory / spare part" &&
+          String(record.brand ?? "").toLowerCase() ===
+            item.brand.toLowerCase() &&
+          String(record.model ?? "").toLowerCase() ===
+            item.model.toLowerCase() &&
+          String(record.identifier || record.model || "").toLowerCase() ===
+            sku.toLowerCase() &&
+          record.status !== "Sold" &&
+          isCurrencyCode(record.currencyCode) &&
+          record.currencyCode === purchaseCurrency;
 
-          return (
-            record.category === "Accessory / spare part" &&
-            record.brand.toLowerCase() === item.brand.toLowerCase() &&
-            record.model.toLowerCase() === item.model.toLowerCase() &&
-            (record.identifier || record.model).toLowerCase() ===
-              sku.toLowerCase() &&
-            record.status !== "Sold" &&
-            recordCurrency === purchaseCurrency
-          );
-        });
+        const existingIndex = updatedInventory.findIndex((record) =>
+          matchesAccessory(record) &&
+          getKnownCostAmount(record.costPrice) !== null &&
+          getKnownStockQuantity(record.quantity) !== null
+        );
+
+        if (
+          existingIndex < 0 &&
+          updatedInventory.some(
+            (record) =>
+              matchesAccessory(record) &&
+              (getKnownCostAmount(record.costPrice) === null ||
+                getKnownStockQuantity(record.quantity) === null)
+          )
+        ) {
+          accessoryLinesSeparatedForUnknownStockData += 1;
+        }
 
         if (existingIndex >= 0) {
           const existing = updatedInventory[existingIndex];
-          const oldQuantity = existing.quantity || 0;
-          const newQuantity = oldQuantity + item.quantity;
-          const oldCost = Number(existing.costPrice || 0);
+          const oldCost = getKnownCostAmount(existing.costPrice);
+          const oldQuantity = getKnownStockQuantity(existing.quantity);
 
-          const weightedCost =
-            (oldCost * oldQuantity + item.unitCost * item.quantity) /
-            newQuantity;
+          if (oldCost !== null && oldQuantity !== null) {
+            const newQuantity = oldQuantity + item.quantity;
+            const oldTotalCost = oldCost * oldQuantity;
+            const incomingTotalCost = item.unitCost * item.quantity;
+            const combinedTotalCost = oldTotalCost + incomingTotalCost;
+            if (
+              !Number.isSafeInteger(newQuantity) ||
+              !Number.isFinite(oldTotalCost) ||
+              !Number.isFinite(incomingTotalCost) ||
+              !Number.isFinite(combinedTotalCost) ||
+              newQuantity <= 0
+            ) {
+              setError(
+                "Cannot receive this purchase because the combined accessory stock quantity or cost is outside the supported numeric range. No records were changed."
+              );
+              return;
+            }
+            const weightedCost =
+              combinedTotalCost / newQuantity;
+            if (!Number.isFinite(weightedCost)) {
+              setError(
+                "Cannot receive this purchase because the weighted accessory cost is invalid. No records were changed."
+              );
+              return;
+            }
 
-          updatedInventory[existingIndex] = {
-            ...existing,
-            quantity: newQuantity,
-            costPrice: String(weightedCost),
-            sellingPrice: String(
-              item.sellingPrice || existing.sellingPrice || 0
-            ),
-            status: "In shop",
-            currencyCode: purchaseCurrency,
-            updated: "Just now",
-          };
-        } else {
-          updatedInventory.push({
-            id: `STOCK-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-            brand: item.brand,
-            model: item.model,
-            identifier: sku,
-            status: "In shop",
-            colour: item.colour,
-            condition: item.condition,
-            costPrice: String(item.unitCost),
-            sellingPrice: String(item.sellingPrice),
-            category: "Accessory / spare part",
-            quantity: item.quantity,
-            secondaryIdentifiers: [],
-            updated: "Just now",
-            currencyCode: purchaseCurrency,
-          });
+            updatedInventory[existingIndex] = {
+              ...existing,
+              quantity: newQuantity,
+              costPrice: String(weightedCost),
+              sellingPrice: String(
+                item.sellingPrice || existing.sellingPrice || 0
+              ),
+              status: "In shop",
+              currencyCode: purchaseCurrency,
+              updated: "Just now",
+            };
+            continue;
+          }
         }
+
+        updatedInventory.push({
+          id: `STOCK-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          brand: item.brand,
+          model: item.model,
+          identifier: sku,
+          status: "In shop",
+          colour: item.colour,
+          condition: item.condition,
+          costPrice: String(item.unitCost),
+          sellingPrice: String(item.sellingPrice),
+          category: "Accessory / spare part",
+          quantity: item.quantity,
+          secondaryIdentifiers: [],
+          updated: "Just now",
+          currencyCode: purchaseCurrency,
+        });
       }
     }
 
@@ -503,32 +1041,32 @@ export default function Purchases() {
     const creditRecord: CreditRecord = {
       id: `CREDIT-${Date.now()}`,
       type: "Payable",
-      party: purchase.supplier,
-      contact: purchase.supplierContact,
-      reference: purchase.invoiceReference || purchase.id,
-      description: `Stock purchase ${purchase.id}`,
-      originalAmount: purchase.total,
-      dueDate: purchase.dueDate,
+      party: currentPurchase.supplier,
+      contact: currentPurchase.supplierContact,
+      reference: currentPurchase.invoiceReference || currentPurchase.id,
+      description: `Stock purchase ${currentPurchase.id}`,
+      originalAmount: currentPurchase.total,
+      dueDate: currentPurchase.dueDate,
       createdAt: new Date().toISOString(),
       payments:
-        purchase.initialPayment > 0
+        currentPurchase.initialPayment > 0
           ? [
               {
                 id: `PAY-${Date.now()}`,
-                amount: purchase.initialPayment,
+                amount: currentPurchase.initialPayment,
                 date: new Date().toISOString(),
               },
             ]
           : [],
-      purchaseId: purchase.id,
+      purchaseId: currentPurchase.id,
       currencyCode: purchaseCurrency,
     };
 
     const updatedCredits = [creditRecord, ...credits];
 
     // Prepare the updated purchase history.
-    const updatedPurchases = purchases.map((record) =>
-      record.id === purchase.id
+    const updatedPurchases = latestPurchases.records.map((record) =>
+      record.id === currentPurchase.id
         ? {
             ...record,
             status: "Received" as PurchaseStatus,
@@ -538,24 +1076,40 @@ export default function Purchases() {
         : record
     );
 
-    // Save all three records together, restoring previous values if a save fails.
+    // localStorage has no multi-key transaction. Write each key in sequence
+    // and attempt a cautious rollback if a later write fails.
     const result = saveStorageBatch([
       {
         key: INVENTORY_KEY,
         value: updatedInventory,
+        expectedRaw: inventorySnapshot.raw,
       },
       {
         key: CREDIT_KEY,
         value: updatedCredits,
+        expectedRaw: creditSnapshot.raw,
       },
       {
         key: PURCHASES_KEY,
         value: updatedPurchases,
+        expectedRaw: latestPurchases.raw,
       },
     ]);
 
     if (!result.success) {
-      if (result.rollbackSucceeded) {
+      if (result.conflict) {
+        const currentPurchases = readStoredArray<PurchaseRecord>(PURCHASES_KEY);
+        if (currentPurchases) {
+          setPurchaseReadState(toStoredArrayReadState(currentPurchases));
+        } else {
+          setPurchaseReadState((current) =>
+            current.readError ? current : { ...current, readError: true }
+          );
+        }
+        setError(
+          "Inventory, credit, or purchase records changed in another tab. The latest purchase history was loaded; review and try again."
+        );
+      } else if (result.rollbackSucceeded) {
         setError(
           "Stock receiving could not be completed because a storage save failed. Previous records were restored. Please try again."
         );
@@ -569,32 +1123,65 @@ export default function Purchases() {
     }
 
     // Update the React interface only after all three saves succeed.
-    setPurchases(updatedPurchases);
+    setPurchaseReadState({
+      records: updatedPurchases,
+      hasValidSnapshot: true,
+      readError: false,
+    });
+    setCreditReadState({
+      records: updatedCredits,
+      hasValidSnapshot: true,
+      readError: false,
+    });
 
     setMessage(
-      `Stock received successfully. Inventory updated and supplier credit linked for ${purchase.supplier} in ${purchaseCurrency}.`
+      `Stock received successfully. Inventory updated and supplier credit linked for ${currentPurchase.supplier} in ${purchaseCurrency}.${
+        accessoryLinesSeparatedForUnknownStockData > 0
+          ? ` ${accessoryLinesSeparatedForUnknownStockData} accessory line(s) were added as separate stock records because matching stock had invalid cost or quantity data; the existing records were preserved.`
+          : ""
+      }`
     );
   };
 
   const getPurchasePayment = (purchase: PurchaseRecord) => {
-    const credits = readStorage<CreditRecord[]>(CREDIT_KEY, []);
-    const linked = credits.find((credit) => credit.purchaseId === purchase.id);
+    if (creditReadState.readError || !creditReadState.hasValidSnapshot) {
+      return null;
+    }
+
+    const linked = creditReadState.records.find(
+      (credit) => credit.purchaseId === purchase.id
+    );
 
     if (!linked) {
+      const total = getKnownNonNegativeAmount(purchase.total);
+      const paid = getKnownNonNegativeAmount(purchase.initialPayment);
+      const outstanding = getKnownOutstandingBalance(total, paid);
+      if (total === null || paid === null || outstanding === null) return null;
       return {
-        paid: purchase.initialPayment,
-        outstanding: purchase.total - purchase.initialPayment,
+        paid,
+        outstanding,
       };
     }
 
-    const paid = linked.payments.reduce(
-      (sum, payment) => sum + payment.amount,
+    const originalAmount = getKnownNonNegativeAmount(
+      linked.originalAmount
+    );
+    const paid = (linked.payments ?? []).reduce<number | null>(
+      (sum, payment) => {
+        if (sum === null) return null;
+        const updated = sum + payment.amount;
+        return Number.isFinite(updated) ? updated : null;
+      },
       0
     );
+    const outstanding = getKnownOutstandingBalance(originalAmount, paid);
+    if (originalAmount === null || paid === null || outstanding === null) {
+      return null;
+    }
 
     return {
       paid,
-      outstanding: Math.max(0, linked.originalAmount - paid),
+      outstanding,
     };
   };
 
@@ -654,6 +1241,39 @@ export default function Purchases() {
         </p>
       </div>
 
+      {purchaseReadState.readError && (
+        <div
+          role="alert"
+          style={{
+            padding: 12,
+            borderRadius: 8,
+            background: "rgba(239, 68, 68, 0.12)",
+            color: "#f87171",
+            fontSize: 13,
+          }}
+        >
+          {purchaseReadState.hasValidSnapshot
+            ? "Could not read the latest purchase history. Showing the last successfully loaded records; current counts and history may be out of date."
+            : "Purchase history is unavailable because browser storage could not be read. Counts and purchase history cannot be verified."}
+        </div>
+      )}
+
+      {creditReadState.readError && (
+        <div
+          role="alert"
+          style={{
+            padding: 12,
+            borderRadius: 8,
+            background: "rgba(239, 68, 68, 0.12)",
+            color: "#f87171",
+            fontSize: 13,
+          }}
+        >
+          Supplier balances are unavailable because browser storage could not
+          read the supplier-credit ledger.
+        </div>
+      )}
+
       <div
         style={{
           display: "grid",
@@ -665,19 +1285,25 @@ export default function Purchases() {
           <div style={{ color: "var(--muted, #a0a8b7)", fontSize: 12 }}>
             Total purchase records
           </div>
-          <h2 style={{ margin: "8px 0 0" }}>{purchases.length}</h2>
+          <h2 style={{ margin: "8px 0 0" }}>
+            {purchaseReadState.hasValidSnapshot ? purchases.length : "Unavailable"}
+          </h2>
         </div>
         <div style={panelStyle}>
           <div style={{ color: "var(--muted, #a0a8b7)", fontSize: 12 }}>
             Draft purchases
           </div>
-          <h2 style={{ margin: "8px 0 0" }}>{draftCount}</h2>
+          <h2 style={{ margin: "8px 0 0" }}>
+            {purchaseReadState.hasValidSnapshot ? draftCount : "Unavailable"}
+          </h2>
         </div>
         <div style={panelStyle}>
           <div style={{ color: "var(--muted, #a0a8b7)", fontSize: 12 }}>
             Received purchases
           </div>
-          <h2 style={{ margin: "8px 0 0" }}>{receivedCount}</h2>
+          <h2 style={{ margin: "8px 0 0" }}>
+            {purchaseReadState.hasValidSnapshot ? receivedCount : "Unavailable"}
+          </h2>
         </div>
       </div>
 
@@ -784,10 +1410,15 @@ export default function Purchases() {
               value={invoiceCurrency}
               onChange={(event) => {
                 setInvoiceCurrency(event.target.value);
+                setInvoiceCurrencyManuallySelected(true);
+                setInvoiceCurrencyNeedsReview(false);
                 setError("");
                 setMessage("");
               }}
             >
+              <option value="" disabled>
+                Select a currency
+              </option>
               {CURRENCY_OPTIONS.map((currency) => (
                 <option key={currency.code} value={currency.code}>
                   {currency.code} ({currency.decimalPlaces} decimal places)
@@ -800,9 +1431,24 @@ export default function Purchases() {
                 fontSize: 11,
               }}
             >
-              Defaults to your shop currency, but can be changed for each
-              supplier invoice.
+              {currencySettingsNotice ||
+                "Defaults to your shop currency, but can be changed for each supplier invoice."}
             </span>
+            {invoiceCurrencyNeedsReview && (
+              <span
+                style={{ color: "#fbbf24", fontSize: 11 }}
+                role="status"
+              >
+                Shop currency changed. Review the entered amounts, then{" "}
+                <button
+                  type="button"
+                  style={buttonStyle}
+                  onClick={() => setInvoiceCurrencyNeedsReview(false)}
+                >
+                  confirm this currency
+                </button>
+              </span>
+            )}
           </label>
         </div>
 
@@ -892,7 +1538,7 @@ export default function Purchases() {
 
           <label style={fieldStyle}>
             <span style={labelStyle}>
-              Unit purchase cost ({selectedCurrency}) *
+              Unit purchase cost ({selectedCurrency || "select currency"}) *
             </span>
             <CurrencyInput
               style={inputStyle}
@@ -906,12 +1552,13 @@ export default function Purchases() {
               currencyCode={selectedCurrency}
               placeholder="Enter purchase cost"
               required
+              disabled={!selectedCurrency}
             />
           </label>
 
           <label style={fieldStyle}>
             <span style={labelStyle}>
-              Unit selling price ({selectedCurrency})
+              Unit selling price ({selectedCurrency || "select currency"})
             </span>
             <CurrencyInput
               style={inputStyle}
@@ -924,6 +1571,7 @@ export default function Purchases() {
               }
               currencyCode={selectedCurrency}
               placeholder="Enter selling price"
+              disabled={!selectedCurrency}
             />
           </label>
 
@@ -1087,13 +1735,17 @@ export default function Purchases() {
                       </td>
                       <td style={{ padding: 9 }}>{item.quantity}</td>
                       <td style={{ padding: 9 }}>
-                        {formatCurrency(item.unitCost, selectedCurrency)}
+                        {selectedCurrency
+                          ? formatCurrency(item.unitCost, selectedCurrency)
+                          : "Currency unavailable"}
                       </td>
                       <td style={{ padding: 9 }}>
-                        {formatCurrency(
-                          item.quantity * item.unitCost,
-                          selectedCurrency
-                        )}
+                        {selectedCurrency
+                          ? formatCurrency(
+                              item.quantity * item.unitCost,
+                              selectedCurrency
+                            )
+                          : "Currency unavailable"}
                       </td>
                       <td style={{ padding: 9 }}>
                         <button
@@ -1122,10 +1774,12 @@ export default function Purchases() {
                   fontSize: 12,
                 }}
               >
-                Purchase total ({selectedCurrency})
+                Purchase total ({selectedCurrency || "currency unavailable"})
               </span>
               <h2 style={{ margin: "4px 0" }}>
-                {formatCurrency(purchaseTotal, selectedCurrency)}
+                {selectedCurrency
+                  ? formatCurrency(purchaseTotal, selectedCurrency)
+                  : "Currency unavailable"}
               </h2>
             </div>
           </div>
@@ -1140,7 +1794,7 @@ export default function Purchases() {
 
         <label style={{ ...fieldStyle, maxWidth: 300 }}>
           <span style={labelStyle}>
-            Amount already paid ({selectedCurrency})
+            Amount already paid ({selectedCurrency || "currency unavailable"})
           </span>
           <CurrencyInput
             style={inputStyle}
@@ -1148,6 +1802,7 @@ export default function Purchases() {
             onChange={setInitialPayment}
             currencyCode={selectedCurrency}
             placeholder="Enter amount paid"
+            disabled={!selectedCurrency}
           />
         </label>
 
@@ -1167,9 +1822,16 @@ export default function Purchases() {
           <h3 style={{ margin: 0 }}>Purchase history</h3>
         </div>
 
-        {purchases.length === 0 ? (
+        {!purchaseReadState.hasValidSnapshot ? (
           <p style={{ color: "var(--muted, #a0a8b7)", fontSize: 13 }}>
-            No purchases recorded yet.
+            Purchase history is unavailable because browser storage could not be
+            read.
+          </p>
+        ) : purchases.length === 0 ? (
+          <p style={{ color: "var(--muted, #a0a8b7)", fontSize: 13 }}>
+            {purchaseReadState.readError
+              ? "No purchases were present in the last successful read; current history could not be verified."
+              : "No purchases recorded yet."}
           </p>
         ) : (
           <div
@@ -1182,9 +1844,14 @@ export default function Purchases() {
           >
             {purchases.map((purchase) => {
               const payment = getPurchasePayment(purchase);
-              const purchaseCurrency = getRecordCurrency(
-                purchase.currencyCode
-              );
+              const purchaseCurrency = isCurrencyCode(purchase.currencyCode)
+                ? purchase.currencyCode
+                : null;
+              const formatPurchaseAmount = (value: unknown) => {
+                const amount = getKnownNonNegativeAmount(value);
+                if (amount === null) return "Amount unavailable";
+                return formatCurrency(amount, purchaseCurrency);
+              };
 
               return (
                 <div
@@ -1218,7 +1885,7 @@ export default function Purchases() {
                     </div>
                     <div style={{ textAlign: "right" }}>
                       <strong>
-                        {formatCurrency(purchase.total, purchaseCurrency)}
+                        {formatPurchaseAmount(purchase.total)}
                       </strong>
                       <div
                         style={{
@@ -1230,7 +1897,7 @@ export default function Purchases() {
                               : "#fbbf24",
                         }}
                       >
-                        {purchase.status} · {purchaseCurrency}
+                        {purchase.status} · {purchaseCurrency || "currency unavailable"}
                       </div>
                     </div>
                   </div>
@@ -1245,7 +1912,7 @@ export default function Purchases() {
                     {purchase.items.map((item) => (
                       <div key={item.id} style={{ padding: "3px 0" }}>
                         {item.brand} {item.model} — {item.quantity} ×{" "}
-                        {formatCurrency(item.unitCost, purchaseCurrency)}
+                        {formatPurchaseAmount(item.unitCost)}
                       </div>
                     ))}
                   </div>
@@ -1262,11 +1929,13 @@ export default function Purchases() {
                     }}
                   >
                     <span>
-                      Paid: {formatCurrency(payment.paid, purchaseCurrency)}
+                      Paid: {payment ? formatPurchaseAmount(payment.paid) : "Unavailable"}
                     </span>
                     <span>
                       Outstanding:{" "}
-                      {formatCurrency(payment.outstanding, purchaseCurrency)}
+                      {payment
+                        ? formatPurchaseAmount(payment.outstanding)
+                        : "Unavailable"}
                     </span>
                   </div>
 
