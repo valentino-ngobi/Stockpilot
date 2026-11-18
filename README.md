@@ -4,9 +4,11 @@ A responsive frontend prototype for small phone and gadget retailers. The public
 
 ## Current milestone
 
-This project includes a dashboard, a serialized device inventory prototype, browser camera barcode/QR scanning, and demo UI flows for sales/POS, custody, repairs, daily closing, reports, supplier credit/customer layaway, team/branches, and settings.
+This project includes a dashboard, serialized device and accessory inventory, browser camera barcode/QR scanning, and working browser-local flows for sales/POS, purchases, supplier credit/customer receivables, daily closing, reports, and settings. Custody, repairs, team/branches, and some navigation screens remain demonstrations.
 
-**Important:** these are frontend prototypes with fictional demonstration data. They are not a production-ready retail system. Records are kept in page state and disappear when the page refreshes. There is no live authentication, database, real role enforcement, actual payment processing, PDF/WhatsApp/SMS delivery, verified model catalogue, OCR for printed text, PWA/offline sync, or production audit trail yet.
+**Important:** StockPilot is not a production-ready retail system. Core inventory, sales, purchases, supplier-credit, settings, exchange-rate, and closing records are persisted in this browser's LocalStorage and normally remain after refresh. Other screens still use demonstration data or page state. Clearing browser data, changing browsers, or losing this device can lose locally stored records. LocalStorage does not provide a backend, reliable multi-device synchronization, atomic multi-record transactions, or strong multi-user concurrency control.
+
+There is no live authentication, server-enforced role authorization, actual payment processing, PDF/WhatsApp/SMS delivery, verified model catalogue, OCR for printed text, reliable offline synchronization, or production audit trail yet. Do not use this prototype as the only copy of real shop, customer, IMEI, or financial data.
 
 ## Requirements
 
@@ -37,7 +39,11 @@ Open the local URL printed by Vite, usually `http://localhost:5173`.
 npm run build
 ```
 
-The updated project archive has not been build-verified in this environment because dependency installation timed out. Run the build locally and share any error output so we can fix it.
+Run the production build after making changes:
+
+```bash
+npm run build
+```
 
 ## Camera scanner
 
@@ -52,7 +58,7 @@ Model identification is optional. A model/part-number field accepts values such 
 3. PDF receipts and WhatsApp/SMS sharing.
 4. Daily sales and profit reporting.
 
-The screens for the six core modules are scaffolds to help define and test the workflows. They need persistent data and business rules before real shop use.
+The current browser-local workflows are for development and evaluation only. Validate the business rules and storage behavior before any real shop use.
 
 ## Security and data correctness roadmap
 
