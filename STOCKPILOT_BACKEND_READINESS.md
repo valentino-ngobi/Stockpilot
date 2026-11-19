@@ -12,8 +12,37 @@ The current UI contains useful validation and guarded-write checks, but they run
 - **Reporting:** Overview and Operations derive metrics from locally saved inventory and transaction records. Reports exclude records with invalid amounts, unknown currencies, unknown costs, unsupported payment methods, or unavailable rates and display incompleteness notices.
 - **Prototype sections:** custody, repairs, team/branches, and other demonstration screens are not a complete server-backed implementation.
 - **Persistence boundary:** data is isolated to one browser profile and device. LocalStorage can be cleared or lost, is not a backup, and does not synchronize across users or devices.
-- **Authentication and authorization:** there is no production authentication or server-enforced shop membership/role model. Frontend visibility is not an access-control boundary.
-- **Testing:** Vitest tests cover shared financial-value, currency snapshot, conversion, and payment-method validation. Page-level and multi-tab transaction behavior still needs broader automated coverage.
+- **Authentication and authorization:** the Supabase Auth and shop/branch migration is applied and its local RLS suite passed 42/42 assertions. Hosted/production RLS and browser-based authentication flows remain unverified. Prototype mode remains unauthenticated; frontend visibility is not an access-control boundary.
+- **Testing:** Vitest covers shared financial-value, currency snapshot, conversion, payment-method, and Auth-service behavior. Page-level and multi-tab transaction behavior still needs broader automated coverage.
+
+## Phase 2, Milestone 1 status
+
+The repository now contains a local Supabase configuration, one identity/tenant migration, and a pgTAP suite for shop isolation, branch scope, membership changes, anonymous denial, and onboarding. The React app supports email registration/login, session restoration/logout, shop creation, authorized shop and branch selection, owner-created branches, and owner-scoped member role/branch assignment when Supabase is configured.
+
+This is a locally verified identity foundation, not production backend readiness. Supabase CLI 3.2.0 reported the local project target, and `supabase migration list` showed migration `202611190001` applied. `supabase test db` passed 42/42 pgTAP assertions against `127.0.0.1:54322`. No hosted project was created or connected. The 44/44 frontend tests exercise service calls and configuration mode only; browser-based registration, login, session restoration, and hosted RLS remain unverified.
+
+The local database, Auth, REST, Storage, Realtime, Studio, Kong, Analytics, and Edge Runtime containers were running; Docker reported most as healthy. Supabase CLI status marked `imgproxy` and `pooler` stopped, and Docker reported the `vector` container restarting. These ancillary services were not required by this identity/tenant migration or pgTAP run. The initial test attempts exposed a data-modifying CTE placement error and two invalid `IS NULL` assertions against `RETURNS void` RPCs; the test SQL was corrected, then all 42 assertions passed. No database reset was used.
+
+Repository verification on 2026-11-19: `npm test` passed 44/44 tests, `npx tsc -b --pretty false` passed, `npm run build` passed with Vite 6.4.6, and `git diff --check` passed. Local database results do not verify a hosted production configuration or browser-based Auth flows.
+
+The supported roles are `owner`, `manager`, `sales_staff`, and `inventory_staff`. Managers and staff are branch-scoped; owners can view and manage all active branches in their shop. Only owners can create branches, assign registered accounts to roles/branches, or suspend non-owner memberships. Owner transfer and email invitations are not implemented; membership assignment currently uses the target user's registered account UUID. Since business tables are not part of this milestone, role-specific access to sales versus inventory operations still needs to be enforced in those later table policies.
+
+### Approved business rules for later milestones
+
+The product owner has approved these domain rules. They guide later schema and transaction design, but are deliberately not implemented in the identity/tenant migration:
+
+- A business can operate multiple branches.
+- Customer sales must support full, partial, and multiple payments.
+- Accessory inventory uses weighted-average costing, with separate cost pools per currency.
+- Staff must explicitly select a customer-credit sale; the system must not infer credit from an unpaid balance.
+
+No sales, payment, inventory, purchase, supplier/customer credit, accounting, or closing tables are part of Milestone 1. Final definitions for refunds, payment allocation, rounding, and accessory cost-layer transitions remain to be confirmed before those migrations.
+
+When both `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY` are absent, the existing LocalStorage workflows remain available in a visible unauthenticated prototype mode. Partial/invalid configuration fails closed. When configured, the Auth/tenant UI is separate and does not expose the still-LocalStorage financial workflows. No automatic migration or LocalStorage record changes occur.
+
+Browser configuration rejects Supabase secret keys and legacy JWT keys whose role claim is `service_role`; Vite startup/build also stops before bundling them. Only a publishable or legacy anon key belongs in the Vite environment.
+
+Local development uses `supabase start` and `supabase test db`. The checked-in config and migration were exercised with CLI 3.2.0. `supabase db reset` is destructive to local database state and was not used. Auth email confirmations are disabled only in the checked-in local config to simplify local development; production confirmation and redirect settings must be configured separately.
 
 ## Current reliability safeguards
 
@@ -27,15 +56,15 @@ Use PostgreSQL as the authoritative relational store, with Supabase Auth/Postgre
 
 Suggested core entities (final schema should follow domain discovery and migration tests):
 
-1. `shops` and `shop_memberships` — shop ownership, member identity, role, and membership status.
+1. Verify the prepared `user_profiles`, `shops`, `shop_memberships`, `branches`, and `branch_memberships` foundation before exposing financial APIs.
 2. `products` — shared catalog fields for accessories and product descriptions.
 3. `inventory_units` — serialized device identifiers and current ownership/location/status.
-4. `inventory_balances` or `stock_lots` — non-serialized accessory quantities and cost layers.
+4. `inventory_balances` or `stock_lots` — non-serialized accessory quantities and weighted-average cost pools separated by currency.
 5. `inventory_movements` — append-only receiving, sale, transfer, custody, repair, adjustment, and return events.
 6. `sales` and `sale_lines` — transaction date, sale currency, discounts, totals, and item-level quantities/prices/cost snapshots.
-7. `sale_payments` — one or more payments per sale, each with amount, currency, method, status, and timestamp. This enables partial payments without pretending a whole sale was received in one method.
+7. `sale_payments` — one or more payments per sale, each with amount, currency, method, status, and timestamp. This supports full, partial, and multiple payments without pretending a whole sale was received in one method.
 8. `purchases` and `purchase_lines` — invoice currency, item quantities/costs, initial payment, supplier references, and receipt status.
-9. `supplier_accounts`, `customer_accounts`, and `credit_payments` — principal, payments, outstanding balance derivation, and currency per account.
+9. `supplier_accounts`, `customer_accounts`, and `credit_payments` — principal, payments, outstanding balance derivation, and currency per account. Customer credit must be explicitly selected by staff.
 10. `cash_movements` and `daily_closings` — opening float, cash receipts, paid-outs, counted cash, and immutable close/reopen or correction events.
 11. `exchange_rate_snapshots` — provider, base currency, fetch/update times, rates, and source metadata. A reference rate must remain distinct from settlement amounts.
 12. `audit_events` — actor, shop, action, entity, before/after references, request/idempotency key, and timestamp.
@@ -55,7 +84,7 @@ Every tenant-owned row should carry a `shop_id`. Use foreign keys, non-negative 
 ## Migration sequence
 
 1. Finalize domain definitions for sale payments, discounts/refunds, accessory cost layers, supplier credit, cash movements, and status transitions before freezing a schema.
-2. Implement Auth, shops, memberships, and server-side authorization first; test tenant isolation before exposing financial APIs.
+2. Run and review the prepared Auth, shop, membership, branch, and RLS migrations/tests locally; resolve policy findings before exposing financial APIs.
 3. Add transaction-safe inventory, sales/payment, purchasing/receiving, credit, and daily-close endpoints. Keep writes behind service functions and idempotency keys.
 4. Add schema constraints, audit events, backup/restore procedures, retention rules, observability, and failure recovery.
 5. Build an explicit, user-triggered LocalStorage export/import tool. Validate a copy offline, report duplicates and invalid records, preserve original currency/date values, and require the user to resolve unknown values. Never auto-migrate by guessing currencies or costs.

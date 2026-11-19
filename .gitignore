@@ -31,3 +31,7 @@ service-account*.json
 *.csv
 *.xlsx
 *.jsonl
+
+# Local Supabase CLI state and generated credentials
+/supabase/.temp/
+/supabase/.branches/

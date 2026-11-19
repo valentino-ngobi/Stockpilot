@@ -9,11 +9,38 @@ import {
   Sun,
 } from "lucide-react";
 import Sidebar, { type PageKey } from "./components/Sidebar";
+import BackendAuthGate from "./components/BackendAuthGate";
+import { supabaseConfiguration } from "./lib/supabase";
 const Overview = lazy(() => import("./pages/Overview"));
 const Inventory = lazy(() => import("./pages/Inventory"));
 const Sales = lazy(() => import("./pages/sales"));
 const Operations = lazy(() => import("./pages/Operations"));
+
 export default function App() {
+  if (supabaseConfiguration.mode === "configured") {
+    return <BackendAuthGate />;
+  }
+
+  if (supabaseConfiguration.mode === "invalid") {
+    return (
+      <main className="backend-auth-page">
+        <section className="surface-card backend-auth-card" role="alert">
+          <h1>Backend configuration incomplete</h1>
+          <p>{supabaseConfiguration.message}</p>
+          <p>
+            Set both public Supabase values to enter authenticated mode. To use
+            the existing browser-local workflows, remove both values and restart
+            Vite; that mode is a local prototype, not a tenant-secure session.
+          </p>
+        </section>
+      </main>
+    );
+  }
+
+  return <PrototypeWorkspace />;
+}
+
+function PrototypeWorkspace() {
   const [activePage, setActivePage] = useState<PageKey>("Overview");
   const [darkMode, setDarkMode] = useState(true);
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -31,6 +58,10 @@ export default function App() {
       />
 
       <main className="main-panel">
+        <div className="prototype-mode-banner" role="status">
+          <strong>Local prototype mode</strong>
+          <span>Not authenticated or tenant-secure · records stay in this browser</span>
+        </div>
         <header className="topbar">
           <div className="topbar-left">
             <button className="icon-button mobile-menu-button" onClick={() => setMobileOpen(true)} aria-label="Open navigation">

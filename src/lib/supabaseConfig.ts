@@ -1,0 +1,51 @@
+import { isSecretSupabaseKey } from "./supabaseKey";
+
+export type SupabaseConfiguration =
+  | { mode: "prototype" }
+  | { mode: "invalid"; message: string }
+  | { mode: "configured"; url: string; publishableKey: string };
+
+export function resolveSupabaseConfiguration(
+  urlValue: string | undefined,
+  publishableKeyValue: string | undefined,
+): SupabaseConfiguration {
+  const url = urlValue?.trim() ?? "";
+  const publishableKey = publishableKeyValue?.trim() ?? "";
+
+  if (!url && !publishableKey) return { mode: "prototype" };
+
+  if (!url || !publishableKey) {
+    return {
+      mode: "invalid",
+      message:
+        "Both VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY are required. Check the local environment file; no data was changed.",
+    };
+  }
+
+  if (isSecretSupabaseKey(publishableKey)) {
+    return {
+      mode: "invalid",
+      message:
+        "A Supabase secret or service-role key cannot be used in browser configuration. Use a publishable key; no local data was opened.",
+    };
+  }
+
+  try {
+    const parsedUrl = new URL(url);
+    const isLocalHttp =
+      parsedUrl.protocol === "http:" &&
+      ["localhost", "127.0.0.1", "[::1]"].includes(parsedUrl.hostname);
+
+    if (parsedUrl.protocol !== "https:" && !isLocalHttp) {
+      throw new Error("Use HTTPS, except for a local development URL.");
+    }
+  } catch {
+    return {
+      mode: "invalid",
+      message:
+        "VITE_SUPABASE_URL must be a valid HTTPS URL (or a local HTTP URL for development). No LocalStorage workflow was opened.",
+    };
+  }
+
+  return { mode: "configured", url, publishableKey };
+}

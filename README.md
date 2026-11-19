@@ -4,15 +4,15 @@ A responsive frontend prototype for small phone and gadget retailers. The public
 
 ## Current milestone
 
-This project includes a dashboard, serialized device and accessory inventory, browser camera barcode/QR scanning, and working browser-local flows for sales/POS, purchases, supplier credit/customer receivables, daily closing, reports, and settings. Custody, repairs, team/branches, and some navigation screens remain demonstrations.
+This project includes a dashboard, serialized device and accessory inventory, browser camera barcode/QR scanning, and browser-local flows for sales/POS, purchases, supplier credit/customer receivables, daily closing, reports, and settings. Custody, repairs, and some navigation screens remain demonstrations. The repository now includes a first Supabase Auth and shop/branch access foundation, but business records are not yet connected to PostgreSQL.
 
-**Important:** StockPilot is not a production-ready retail system. Core inventory, sales, purchases, supplier-credit, settings, exchange-rate, and closing records are persisted in this browser's LocalStorage and normally remain after refresh. Other screens still use demonstration data or page state. Clearing browser data, changing browsers, or losing this device can lose locally stored records. LocalStorage does not provide a backend, reliable multi-device synchronization, atomic multi-record transactions, or strong multi-user concurrency control.
+**Important:** StockPilot is not a production-ready retail system. With Supabase environment values absent, it opens the clearly labeled local prototype: core inventory, sales, purchases, supplier-credit, settings, exchange-rate, and closing records remain in this browser's LocalStorage. With both Supabase values configured, it opens the Auth and shop/branch foundation; financial workflows are intentionally not shown in authenticated mode until they have server-backed implementations. LocalStorage records are not migrated or changed by the Auth foundation. Clearing browser data, changing browsers, or losing this device can lose local records.
 
-There is no live authentication, server-enforced role authorization, actual payment processing, PDF/WhatsApp/SMS delivery, verified model catalogue, OCR for printed text, reliable offline synchronization, or production audit trail yet. Do not use this prototype as the only copy of real shop, customer, IMEI, or financial data.
+The identity migration `202611190001` has been applied to the local Supabase database, and its pgTAP security suite passed **42/42 assertions**. The frontend suite passed **44/44 tests**; TypeScript compilation and the production build passed. Hosted/production RLS and browser-based authentication flows remain unverified. Financial workflows remain LocalStorage-backed and are not connected to PostgreSQL. Actual payment processing, PDF/WhatsApp/SMS delivery, verified model catalogue, OCR for printed text, reliable offline synchronization, and a production audit trail are not implemented. Do not use this prototype as the only copy of real shop, customer, IMEI, or financial data.
 
 ## Requirements
 
-- Node.js 20.19+ or 22.12+
+- Node.js 22.12+
 - npm
 - Visual Studio Code
 - Chrome or another modern browser
@@ -39,6 +39,14 @@ Open the local URL printed by Vite, usually `http://localhost:5173`.
 npm run build
 ```
 
+## Local Supabase foundation
+
+The Supabase configuration, identity/tenant migration, and pgTAP tests are in `supabase/`. Supabase CLI 3.2.0 reported migration `202611190001` applied to the verified local database, and `supabase test db` passed all 42 assertions. For a fresh disposable local database, install the Supabase CLI using its official instructions, start Docker, then run `supabase start`, `supabase db reset`, and `supabase test db`. The reset command is destructive to that local database; it was not used during this verification.
+
+Copy `.env.example` to an ignored local environment file and use the local API URL and publishable key printed by the CLI. The browser publishable key is not a secret; never put a secret/service-role key in a `VITE_*` variable. Hosted/production RLS and transaction behavior must be verified before production use.
+
+When both variables are absent, StockPilot remains in unauthenticated LocalStorage prototype mode. When configured, it presents the separate Auth and shop/branch foundation; it does not read or write the existing financial LocalStorage records in that mode.
+
 Run the production build after making changes:
 
 ```bash
@@ -62,7 +70,7 @@ The current browser-local workflows are for development and evaluation only. Val
 
 ## Security and data correctness roadmap
 
-- Supabase Auth + PostgreSQL Row Level Security and shop membership.
+- Local shop and branch identity migration and RLS suite verified (42/42 assertions); hosted/production RLS and browser authentication flows remain unverified.
 - Backend-enforced owner/admin/attendant permissions; never rely on frontend hiding alone for cost-price protection.
 - Device-level unique identifier constraints and a full identifier history.
 - Append-only audit events and server-side transaction rules.
