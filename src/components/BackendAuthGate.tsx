@@ -12,6 +12,13 @@ import {
   setMemberAccess,
   suspendMember,
 } from "../lib/auth";
+import {
+  clearShopBranchSelection,
+  readShopBranchSelection,
+  resolveAuthorizedBranchId,
+  resolveAuthorizedShopId,
+  writeShopBranchSelection,
+} from "../lib/selectionPreference";
 import { supabase } from "../lib/supabase";
 
 type ShopRole = "owner" | "manager" | "sales_staff" | "inventory_staff";
@@ -149,6 +156,7 @@ export default function BackendAuthGate() {
       if (membershipRows.length === 0) {
         setShops([]);
         setSelectedShopId("");
+        clearShopBranchSelection(session.user.id);
         return;
       }
 
@@ -168,15 +176,22 @@ export default function BackendAuthGate() {
         name: String(shop.name),
         role: roleByShop.get(String(shop.id)) ?? "sales_staff",
       }));
+      const savedSelection = readShopBranchSelection(session.user.id);
+      const authorizedShopIds = availableShops.map((shop) => shop.id);
+      const resolvedShopId = resolveAuthorizedShopId(savedSelection, authorizedShopIds);
 
       setShops(availableShops);
-      setSelectedShopId((current) =>
-        availableShops.some((shop) => shop.id === current)
-          ? current
-          : availableShops.length === 1
-            ? availableShops[0].id
-            : "",
-      );
+      setSelectedShopId(resolvedShopId);
+      if (!resolvedShopId) {
+        clearShopBranchSelection(session.user.id);
+      } else {
+        writeShopBranchSelection(session.user.id, {
+          shopId: resolvedShopId,
+          branchId: savedSelection?.shopId === resolvedShopId
+            ? savedSelection.branchId
+            : null,
+        });
+      }
     } catch (error) {
       if (isCurrent()) {
         setShopsError(errorMessage(error, "Could not load your shop memberships."));
@@ -200,7 +215,7 @@ export default function BackendAuthGate() {
   );
 
   useEffect(() => {
-    if (!client || !selectedShopId) {
+    if (!client || !selectedShopId || !session?.user.id) {
       setBranches([]);
       setSelectedBranchId("");
       setBranchesLoading(false);
@@ -210,6 +225,7 @@ export default function BackendAuthGate() {
     }
 
     let active = true;
+    const userId = session.user.id;
     setBranchesLoading(true);
     setBranches([]);
     setSelectedBranchId("");
@@ -233,14 +249,18 @@ export default function BackendAuthGate() {
           name: String(branch.name),
           is_primary: Boolean(branch.is_primary),
         }));
-        setBranches(accessibleBranches);
-        setSelectedBranchId((current) =>
-          accessibleBranches.some((branch) => branch.id === current)
-            ? current
-            : accessibleBranches.length === 1
-              ? accessibleBranches[0].id
-              : "",
+        const savedSelection = readShopBranchSelection(userId);
+        const resolvedBranchId = resolveAuthorizedBranchId(
+          savedSelection,
+          selectedShopId,
+          accessibleBranches.map((branch) => branch.id),
         );
+        setBranches(accessibleBranches);
+        setSelectedBranchId(resolvedBranchId);
+        writeShopBranchSelection(userId, {
+          shopId: selectedShopId,
+          branchId: resolvedBranchId || null,
+        });
       } catch (error) {
         if (active) {
           setBranchesError(errorMessage(error, "Could not load authorized branches."));
@@ -253,7 +273,7 @@ export default function BackendAuthGate() {
     return () => {
       active = false;
     };
-  }, [client, selectedShopId]);
+  }, [client, selectedShopId, session?.user.id]);
 
   const [membersRevision, setMembersRevision] = useState(0);
 
@@ -336,6 +356,12 @@ export default function BackendAuthGate() {
         { id: createdShopId, name: shopName.trim(), role: "owner" },
       ]);
       setSelectedShopId(createdShopId);
+      if (session?.user.id) {
+        writeShopBranchSelection(session.user.id, {
+          shopId: createdShopId,
+          branchId: null,
+        });
+      }
       setShopName("");
       setActionNotice("Shop created. You are its owner and its primary branch is ready.");
     } catch (error) {
@@ -544,7 +570,9 @@ export default function BackendAuthGate() {
                   <label className="inventory-field">
                     <span>Business</span>
                     <select value={selectedShopId} onChange={(event) => {
-                      setSelectedShopId(event.target.value);
+                      const nextShopId = event.target.value;
+                      if (nextShopId && !shops.some((shop) => shop.id === nextShopId)) return;
+                      setSelectedShopId(nextShopId);
                       setSelectedBranchId("");
                       setBranches([]);
                       setBranchesLoading(Boolean(event.target.value));
@@ -553,6 +581,14 @@ export default function BackendAuthGate() {
                       setMembers([]);
                       setActionError("");
                       setActionNotice("");
+                      if (nextShopId && session?.user.id) {
+                        writeShopBranchSelection(session.user.id, {
+                          shopId: nextShopId,
+                          branchId: null,
+                        });
+                      } else if (session?.user.id) {
+                        clearShopBranchSelection(session.user.id);
+                      }
                     }}>
                       <option value="">Choose a business</option>
                       {shops.map((shop) => <option value={shop.id} key={shop.id}>{shop.name} · {roleLabels[shop.role]}</option>)}
@@ -563,7 +599,17 @@ export default function BackendAuthGate() {
                       <span>Authorized branch</span>
                       <select
                         value={selectedBranchId}
-                        onChange={(event) => setSelectedBranchId(event.target.value)}
+                        onChange={(event) => {
+                          const nextBranchId = event.target.value;
+                          if (nextBranchId && !branches.some((branch) => branch.id === nextBranchId)) return;
+                          setSelectedBranchId(nextBranchId);
+                          if (session?.user.id && shops.some((shop) => shop.id === selectedShopId)) {
+                            writeShopBranchSelection(session.user.id, {
+                              shopId: selectedShopId,
+                              branchId: nextBranchId || null,
+                            });
+                          }
+                        }}
                         disabled={branchesLoading || branches.length === 0}
                       >
                         <option value="">Choose a branch</option>
