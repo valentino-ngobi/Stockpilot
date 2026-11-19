@@ -1,7 +1,7 @@
 begin;
 
 create extension if not exists pgtap with schema extensions;
-select plan(42);
+select plan(59);
 
 insert into auth.users (
   id, aud, role, email, encrypted_password, email_confirmed_at,
@@ -199,13 +199,13 @@ select lives_ok(
   $$ select public.owner_set_member_access(
     '20000000-0000-4000-8000-000000000001',
     '10000000-0000-4000-8000-000000000004',
-    'inventory_staff',
+    'manager',
     array['30000000-0000-4000-8000-000000000002']::uuid[]
   ) $$,
   'shop owner can assign a registered member to a branch'
 );
 select is(
-  (select count(*)::integer from public.shop_memberships where shop_id = '20000000-0000-4000-8000-000000000001' and user_id = '10000000-0000-4000-8000-000000000004' and role = 'inventory_staff' and status = 'active'),
+  (select count(*)::integer from public.shop_memberships where shop_id = '20000000-0000-4000-8000-000000000001' and user_id = '10000000-0000-4000-8000-000000000004' and role = 'manager' and status = 'active'),
   1,
   'owner assignment creates the selected role'
 );
@@ -243,8 +243,109 @@ select is(
 );
 select is(
   (select count(*)::integer from public.branch_memberships where shop_id = '20000000-0000-4000-8000-000000000001' and user_id = '10000000-0000-4000-8000-000000000004'),
+  1,
+  'suspension preserves the member branch assignment'
+);
+select set_config('request.jwt.claim.sub', '10000000-0000-4000-8000-000000000004', true);
+select is(
+  (select count(*)::integer from public.shops where id = '20000000-0000-4000-8000-000000000001'),
   0,
-  'suspension removes branch assignments'
+  'suspended member cannot read their shop'
+);
+select is(
+  (select count(*)::integer from public.branches where id = '30000000-0000-4000-8000-000000000002'),
+  0,
+  'suspended member cannot read their previously assigned branch'
+);
+select set_config('request.jwt.claim.sub', '10000000-0000-4000-8000-000000000001', true);
+select is(
+  (select count(*)::integer from public.shop_memberships where shop_id = '20000000-0000-4000-8000-000000000001' and user_id = '10000000-0000-4000-8000-000000000004' and status = 'suspended'),
+  1,
+  'owner can still read the suspended member record'
+);
+select lives_ok(
+  $$ select public.owner_reactivate_shop_member(
+    '20000000-0000-4000-8000-000000000001',
+    '10000000-0000-4000-8000-000000000004'
+  ) $$,
+  'shop owner can reactivate a suspended manager'
+);
+select is(
+  (select count(*)::integer from public.shop_memberships where shop_id = '20000000-0000-4000-8000-000000000001' and user_id = '10000000-0000-4000-8000-000000000004' and role = 'manager' and status = 'active'),
+  1,
+  'reactivation preserves the member manager role'
+);
+select is(
+  (select count(*)::integer from public.branch_memberships where shop_id = '20000000-0000-4000-8000-000000000001' and user_id = '10000000-0000-4000-8000-000000000004' and branch_id = '30000000-0000-4000-8000-000000000002'),
+  1,
+  'reactivation preserves the existing branch assignment'
+);
+select set_config('request.jwt.claim.sub', '10000000-0000-4000-8000-000000000004', true);
+select is(
+  (select count(*)::integer from public.branches where id = '30000000-0000-4000-8000-000000000002'),
+  1,
+  'reactivated manager can read the same assigned branch'
+);
+select throws_ok(
+  $$ select public.owner_reactivate_shop_member('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000004') $$,
+  '42501', null,
+  'member cannot reactivate their own membership'
+);
+select set_config('request.jwt.claim.sub', '10000000-0000-4000-8000-000000000002', true);
+select throws_ok(
+  $$ select public.owner_reactivate_shop_member('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000004') $$,
+  '42501', null,
+  'non-owner cannot reactivate a member'
+);
+select set_config('request.jwt.claim.sub', '10000000-0000-4000-8000-000000000003', true);
+select throws_ok(
+  $$ select public.owner_reactivate_shop_member('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000004') $$,
+  '42501', null,
+  'owner cannot reactivate membership in another shop'
+);
+select set_config('request.jwt.claim.sub', '10000000-0000-4000-8000-000000000001', true);
+select lives_ok(
+  $$ select public.owner_suspend_shop_member('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000004') $$,
+  'owner can suspend the reactivated member again'
+);
+reset role;
+delete from public.branch_memberships
+where shop_id = '20000000-0000-4000-8000-000000000001'
+  and user_id = '10000000-0000-4000-8000-000000000004';
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '10000000-0000-4000-8000-000000000001', true);
+select throws_ok(
+  $$ select public.owner_reactivate_shop_member('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000004') $$,
+  '22023', null,
+  'reactivation refuses to guess when a legacy member has no saved branch assignments'
+);
+select throws_ok(
+  $$ select public.owner_reactivate_shop_member('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000004', array['30000000-0000-4000-8000-000000000003']::uuid[]) $$,
+  '22023', null,
+  'owner cannot restore a branch from another shop'
+);
+select is(
+  (select count(*)::integer from public.shop_memberships where shop_id = '20000000-0000-4000-8000-000000000001' and user_id = '10000000-0000-4000-8000-000000000004' and status = 'suspended'),
+  1,
+  'member stays suspended when no prior branch assignment can be restored'
+);
+select lives_ok(
+  $$ select public.owner_reactivate_shop_member(
+    '20000000-0000-4000-8000-000000000001',
+    '10000000-0000-4000-8000-000000000004',
+    array['30000000-0000-4000-8000-000000000002']::uuid[]
+  ) $$,
+  'owner can explicitly restore a legacy branch assignment without changing the role'
+);
+select is(
+  (select count(*)::integer from public.shop_memberships where shop_id = '20000000-0000-4000-8000-000000000001' and user_id = '10000000-0000-4000-8000-000000000004' and role = 'manager' and status = 'active'),
+  1,
+  'legacy reactivation preserves the manager role'
+);
+select is(
+  (select count(*)::integer from public.branch_memberships where shop_id = '20000000-0000-4000-8000-000000000001' and user_id = '10000000-0000-4000-8000-000000000004' and branch_id = '30000000-0000-4000-8000-000000000002'),
+  1,
+  'legacy reactivation restores only the owner-selected branch assignment'
 );
 select throws_ok(
   $$ select public.owner_suspend_shop_member('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000001') $$,

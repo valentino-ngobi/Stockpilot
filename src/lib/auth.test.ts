@@ -5,6 +5,7 @@ import {
   createShopForCurrentUser,
   loginWithEmail,
   logout,
+  reactivateMember,
   registerWithEmail,
   restoreSession,
   setMemberAccess,
@@ -118,6 +119,7 @@ describe("authentication and tenant service calls", () => {
     createBranch(client, "shop-id", " Branch Two ");
     setMemberAccess(client, "shop-id", "registered-user-id", "sales_staff", ["branch-id"]);
     suspendMember(client, "shop-id", "registered-user-id");
+    reactivateMember(client, "shop-id", "registered-user-id");
 
     expect(client.rpc).toHaveBeenNthCalledWith(1, "create_branch", {
       p_shop_id: "shop-id",
@@ -132,6 +134,11 @@ describe("authentication and tenant service calls", () => {
     expect(client.rpc).toHaveBeenNthCalledWith(3, "owner_suspend_shop_member", {
       p_shop_id: "shop-id",
       p_user_id: "registered-user-id",
+    });
+    expect(client.rpc).toHaveBeenNthCalledWith(4, "owner_reactivate_shop_member", {
+      p_shop_id: "shop-id",
+      p_user_id: "registered-user-id",
+      p_branch_ids: null,
     });
   });
 });

@@ -7,6 +7,7 @@ import {
   createShopForCurrentUser,
   loginWithEmail,
   logout,
+  reactivateMember,
   registerWithEmail,
   restoreSession,
   setMemberAccess,
@@ -20,6 +21,8 @@ import {
   writeShopBranchSelection,
 } from "../lib/selectionPreference";
 import { supabase } from "../lib/supabase";
+import { togglePasswordVisibility } from "../lib/passwordVisibility";
+import PasswordVisibilityControl from "./PasswordVisibilityControl";
 
 type ShopRole = "owner" | "manager" | "sales_staff" | "inventory_staff";
 type MembershipStatus = "active" | "suspended";
@@ -60,6 +63,7 @@ export default function BackendAuthGate() {
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [passwordVisible, setPasswordVisible] = useState(false);
   const [displayName, setDisplayName] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
   const [authNotice, setAuthNotice] = useState("");
@@ -85,6 +89,8 @@ export default function BackendAuthGate() {
   );
   const [memberBranchIds, setMemberBranchIds] = useState<string[]>([]);
   const [members, setMembers] = useState<MemberRow[]>([]);
+  const [reactivationTargetUserId, setReactivationTargetUserId] = useState("");
+  const [reactivationBranchIds, setReactivationBranchIds] = useState<string[]>([]);
 
   useEffect(() => {
     if (!client) {
@@ -120,6 +126,12 @@ export default function BackendAuthGate() {
       data.subscription.unsubscribe();
     };
   }, [client]);
+
+  useEffect(() => {
+    setPasswordVisible(false);
+    setReactivationTargetUserId("");
+    setReactivationBranchIds([]);
+  }, [session?.user.id]);
 
   const loadShops = useCallback(async (isCurrent: () => boolean) => {
     if (!client || !session?.user.id) {
@@ -316,6 +328,7 @@ export default function BackendAuthGate() {
     event.preventDefault();
     if (!client) return;
 
+    setPasswordVisible(false);
     setAuthBusy(true);
     setAuthError("");
     setAuthNotice("");
@@ -335,8 +348,9 @@ export default function BackendAuthGate() {
         setSession(response.data.session);
         setAuthNotice(authMode === "register" ? "Account created." : "Signed in.");
       }
-    } catch (error) {
-      setAuthError(errorMessage(error, "Authentication could not be completed."));
+    } catch {
+      // Auth provider errors can be shown without echoing any submitted credential.
+      setAuthError("Authentication could not be completed. Check your details and try again.");
     } finally {
       setAuthBusy(false);
     }
@@ -405,6 +419,8 @@ export default function BackendAuthGate() {
       setMemberUserId("");
       setMemberBranchIds([]);
       setActionNotice("Member access saved for the selected branches.");
+      setReactivationTargetUserId("");
+      setReactivationBranchIds([]);
       setMembersRevision((revision) => revision + 1);
     } catch (error) {
       setActionError(errorMessage(error, "Could not update member access."));
@@ -418,10 +434,42 @@ export default function BackendAuthGate() {
     try {
       const { error } = await suspendMember(client, selectedShop.id, userId);
       if (error) throw error;
-      setActionNotice("Membership suspended and branch access removed.");
+      setActionNotice("Membership suspended. Its saved branch access remains blocked until reactivation.");
       setMembersRevision((revision) => revision + 1);
     } catch (error) {
       setActionError(errorMessage(error, "Could not suspend that membership."));
+    }
+  };
+
+  const handleReactivateMember = async (userId: string) => {
+    if (!client || !selectedShop || selectedShop.role !== "owner") return;
+    setActionError("");
+    setActionNotice("");
+    const restoringExplicitBranches = reactivationTargetUserId === userId;
+    try {
+      const { error } = await reactivateMember(
+        client,
+        selectedShop.id,
+        userId,
+        restoringExplicitBranches ? reactivationBranchIds : undefined,
+      );
+      if (error) {
+        if (!restoringExplicitBranches && error.message.includes("No branch assignments are saved.")) {
+          setReactivationTargetUserId(userId);
+          setReactivationBranchIds([]);
+          setActionError(
+            "This older suspension has no saved branch assignments. Select the member's previous branches below; their role will remain unchanged.",
+          );
+          return;
+        }
+        throw error;
+      }
+      setReactivationTargetUserId("");
+      setReactivationBranchIds([]);
+      setActionNotice("Membership reactivated with its existing role and branch access.");
+      setMembersRevision((revision) => revision + 1);
+    } catch (error) {
+      setActionError(errorMessage(error, "Could not reactivate that member."));
     }
   };
 
@@ -511,17 +559,18 @@ export default function BackendAuthGate() {
                 required
               />
             </label>
-            <label className="inventory-field">
-              <span>Password</span>
-              <input
-                type="password"
+            <div className="inventory-field">
+              <span id="auth-password-label">Password</span>
+              <PasswordVisibilityControl
+                id="auth-password"
+                labelledBy="auth-password-label"
                 value={password}
+                visible={passwordVisible}
                 onChange={(event) => setPassword(event.target.value)}
+                onToggle={() => setPasswordVisible((visible) => togglePasswordVisibility(visible))}
                 autoComplete={authMode === "register" ? "new-password" : "current-password"}
-                minLength={8}
-                required
               />
-            </label>
+            </div>
             <button className="button button-primary" type="submit" disabled={authBusy}>
               {authBusy ? "Please wait…" : authMode === "register" ? "Register" : "Sign in"}
             </button>
@@ -530,6 +579,7 @@ export default function BackendAuthGate() {
               type="button"
               onClick={() => {
                 setAuthMode((current) => current === "login" ? "register" : "login");
+                setPasswordVisible(false);
                 setAuthError("");
                 setAuthNotice("");
               }}
@@ -581,6 +631,8 @@ export default function BackendAuthGate() {
                       setMembers([]);
                       setActionError("");
                       setActionNotice("");
+                      setReactivationTargetUserId("");
+                      setReactivationBranchIds([]);
                       if (nextShopId && session?.user.id) {
                         writeShopBranchSelection(session.user.id, {
                           shopId: nextShopId,
@@ -676,10 +728,42 @@ export default function BackendAuthGate() {
                             <small>{member.user_id}</small>
                             <small>{member.status}</small>
                           </div>
-                          {member.role !== "owner" && member.status === "active" && (
-                            <button className="button button-secondary" type="button" onClick={() => void handleSuspendMember(member.user_id)}>
-                              Suspend
-                            </button>
+                          {member.role !== "owner" && (
+                            member.status === "active" ? (
+                              <button className="button button-secondary" type="button" onClick={() => void handleSuspendMember(member.user_id)}>
+                                Suspend
+                              </button>
+                            ) : (
+                              <button
+                                className="button button-secondary"
+                                type="button"
+                                disabled={reactivationTargetUserId === member.user_id && reactivationBranchIds.length === 0}
+                                onClick={() => void handleReactivateMember(member.user_id)}
+                              >
+                                {reactivationTargetUserId === member.user_id
+                                  ? "Reactivate with selected branches"
+                                  : "Reactivate"}
+                              </button>
+                            )
+                          )}
+                          {member.status === "suspended" && reactivationTargetUserId === member.user_id && (
+                            <fieldset className="backend-branch-assignments backend-reactivation-branches">
+                              <legend>Select the previously authorized branches to restore</legend>
+                              {branches.map((branch) => (
+                                <label key={branch.id}>
+                                  <input
+                                    type="checkbox"
+                                    checked={reactivationBranchIds.includes(branch.id)}
+                                    onChange={() => setReactivationBranchIds((current) =>
+                                      current.includes(branch.id)
+                                        ? current.filter((id) => id !== branch.id)
+                                        : [...current, branch.id],
+                                    )}
+                                  />
+                                  <span>{branch.name}</span>
+                                </label>
+                              ))}
+                            </fieldset>
                           )}
                         </div>
                       ))}

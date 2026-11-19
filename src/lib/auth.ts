@@ -79,3 +79,16 @@ export function suspendMember(
     p_user_id: userId,
   });
 }
+
+export function reactivateMember(
+  client: SupabaseClient,
+  shopId: string,
+  userId: string,
+  branchIds?: string[],
+) {
+  return client.rpc("owner_reactivate_shop_member", {
+    p_shop_id: shopId,
+    p_user_id: userId,
+    p_branch_ids: branchIds ?? null,
+  });
+}
