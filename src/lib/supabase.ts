@@ -4,6 +4,10 @@ import { resolveSupabaseConfiguration } from "./supabaseConfig";
 export const supabaseConfiguration = resolveSupabaseConfiguration(
   import.meta.env.VITE_SUPABASE_URL,
   import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
+  {
+    isDevelopment: import.meta.env.DEV,
+    prototypeEnabled: import.meta.env.VITE_STOCKPILOT_PROTOTYPE?.trim() === "true",
+  },
 );
 
 export const supabase =

@@ -28,9 +28,9 @@ export default function App() {
           <h1>Backend configuration incomplete</h1>
           <p>{supabaseConfiguration.message}</p>
           <p>
-            Set both public Supabase values to enter authenticated mode. To use
-            the existing browser-local workflows, remove both values and restart
-            Vite; that mode is a local prototype, not a tenant-secure session.
+            Set both public Supabase values to enter authenticated mode. During
+            development only, set VITE_STOCKPILOT_PROTOTYPE=true to open the
+            existing browser-local prototype; production builds require Supabase.
           </p>
         </section>
       </main>

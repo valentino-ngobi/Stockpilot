@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import type { Session } from "@supabase/supabase-js";
 import { Building2, CheckCircle2, LogOut, Plus, ShieldCheck, XCircle } from "lucide-react";
@@ -20,6 +20,14 @@ import {
   resolveAuthorizedShopId,
   writeShopBranchSelection,
 } from "../lib/selectionPreference";
+import {
+  createAuthorizationRefreshQueue,
+  sameBranchOptions,
+  sameMemberRows,
+  sameShopContexts,
+  watchAuthorizationChanges,
+} from "../lib/authorizationRefresh";
+import { resetPasswordEntry } from "../lib/passwordState";
 import { supabase } from "../lib/supabase";
 import { togglePasswordVisibility } from "../lib/passwordVisibility";
 import PasswordVisibilityControl from "./PasswordVisibilityControl";
@@ -43,6 +51,15 @@ type MemberRow = {
   user_id: string;
   role: ShopRole;
   status: MembershipStatus;
+};
+
+type AuthorizationSnapshot = {
+  userId: string;
+  shops: ShopContext[];
+  selectedShopId: string;
+  branches: BranchOption[];
+  selectedBranchId: string;
+  members: MemberRow[];
 };
 
 const roleLabels: Record<ShopRole, string> = {
@@ -70,7 +87,16 @@ export default function BackendAuthGate() {
   const [authError, setAuthError] = useState("");
 
   const [shops, setShops] = useState<ShopContext[]>([]);
-  const [shopsLoading, setShopsLoading] = useState(false);
+  const shopsRef = useRef(shops);
+  shopsRef.current = shops;
+  const [authorizationRefreshing, setAuthorizationRefreshing] = useState(false);
+  const authorizationRefreshRequestRef = useRef<(() => Promise<void>) | null>(null);
+  const activeAuthorizationUserRef = useRef("");
+  const sessionUserIdRef = useRef("");
+  const selectedShopIdRef = useRef("");
+  const selectedShopUserIdRef = useRef("");
+  const selectedBranchIdRef = useRef("");
+  sessionUserIdRef.current = session?.user.id ?? "";
   const [shopsError, setShopsError] = useState("");
   const [shopsForUserId, setShopsForUserId] = useState("");
   const [selectedShopId, setSelectedShopId] = useState("");
@@ -128,201 +154,253 @@ export default function BackendAuthGate() {
   }, [client]);
 
   useEffect(() => {
-    setPasswordVisible(false);
+    resetPasswordEntry(setPassword, setPasswordVisible);
     setReactivationTargetUserId("");
     setReactivationBranchIds([]);
   }, [session?.user.id]);
 
-  const loadShops = useCallback(async (isCurrent: () => boolean) => {
+  const loadAuthorizationSnapshot = useCallback(async (): Promise<AuthorizationSnapshot> => {
     if (!client || !session?.user.id) {
-      setShops([]);
-      setSelectedShopId("");
-      setShopsError("");
-      setShopsForUserId("");
-      setShopsLoading(false);
-      return;
+      throw new Error("An authenticated session is required to verify authorization.");
     }
 
-    setShopsLoading(true);
-    setShopsError("");
-    setShopsForUserId(session.user.id);
-    setBranches([]);
-    setSelectedBranchId("");
-    setMemberBranchIds([]);
-    setMembers([]);
-    setSelectedShopId("");
-    try {
-      const { data: memberships, error: membershipError } = await client
-        .from("shop_memberships")
-        .select("shop_id, role")
-        .eq("user_id", session.user.id)
-        .eq("status", "active");
+    const userId = session.user.id;
+    const { data: memberships, error: membershipError } = await client
+      .from("shop_memberships")
+      .select("shop_id, role")
+      .eq("user_id", userId)
+      .eq("status", "active");
+    if (membershipError) throw membershipError;
 
-      if (!isCurrent()) return;
-      if (membershipError) throw membershipError;
-      const membershipRows = (memberships ?? []) as Array<{
-        shop_id: string;
-        role: ShopRole;
-      }>;
-
-      if (membershipRows.length === 0) {
-        setShops([]);
-        setSelectedShopId("");
-        clearShopBranchSelection(session.user.id);
-        return;
-      }
-
+    const membershipRows = (memberships ?? []) as Array<{
+      shop_id: string;
+      role: ShopRole;
+    }>;
+    let availableShops: ShopContext[] = [];
+    if (membershipRows.length > 0) {
       const { data: shopRows, error: shopError } = await client
         .from("shops")
         .select("id, name")
         .in("id", membershipRows.map((membership) => membership.shop_id))
-        .order("name");
-
-      if (!isCurrent()) return;
+        .order("name")
+        .order("id");
       if (shopError) throw shopError;
+
       const roleByShop = new Map(
         membershipRows.map((membership) => [membership.shop_id, membership.role]),
       );
-      const availableShops = (shopRows ?? []).map((shop) => ({
+      availableShops = (shopRows ?? []).map((shop) => ({
         id: String(shop.id),
         name: String(shop.name),
         role: roleByShop.get(String(shop.id)) ?? "sales_staff",
       }));
-      const savedSelection = readShopBranchSelection(session.user.id);
-      const authorizedShopIds = availableShops.map((shop) => shop.id);
-      const resolvedShopId = resolveAuthorizedShopId(savedSelection, authorizedShopIds);
-
-      setShops(availableShops);
-      setSelectedShopId(resolvedShopId);
-      if (!resolvedShopId) {
-        clearShopBranchSelection(session.user.id);
-      } else {
-        writeShopBranchSelection(session.user.id, {
-          shopId: resolvedShopId,
-          branchId: savedSelection?.shopId === resolvedShopId
-            ? savedSelection.branchId
-            : null,
-        });
-      }
-    } catch (error) {
-      if (isCurrent()) {
-        setShopsError(errorMessage(error, "Could not load your shop memberships."));
-      }
-    } finally {
-      if (isCurrent()) setShopsLoading(false);
     }
+
+    const savedSelection = readShopBranchSelection(userId);
+    const authorizedShopIds = availableShops.map((shop) => shop.id);
+    const currentShopId = selectedShopUserIdRef.current === userId
+      ? selectedShopIdRef.current
+      : "";
+    const currentSelection = authorizedShopIds.includes(currentShopId)
+      ? {
+          shopId: currentShopId,
+          branchId: selectedBranchIdRef.current || (
+            savedSelection?.shopId === currentShopId ? savedSelection.branchId : null
+          ),
+        }
+      : savedSelection;
+    const resolvedShopId = resolveAuthorizedShopId(currentSelection, authorizedShopIds);
+
+    let availableBranches: BranchOption[] = [];
+    if (resolvedShopId) {
+      const { data, error } = await client
+        .from("branches")
+        .select("id, name, is_primary")
+        .eq("shop_id", resolvedShopId)
+        .eq("is_active", true)
+        .order("is_primary", { ascending: false })
+        .order("name");
+      if (error) throw error;
+      availableBranches = (data ?? []).map((branch) => ({
+        id: String(branch.id),
+        name: String(branch.name),
+        is_primary: Boolean(branch.is_primary),
+      }));
+    }
+
+    const branchSelection = currentSelection?.shopId === resolvedShopId
+      ? currentSelection
+      : savedSelection;
+    const resolvedBranchId = resolvedShopId
+      ? resolveAuthorizedBranchId(
+          branchSelection,
+          resolvedShopId,
+          availableBranches.map((branch) => branch.id),
+        )
+      : "";
+
+    let availableMembers: MemberRow[] = [];
+    if (availableShops.find((shop) => shop.id === resolvedShopId)?.role === "owner") {
+      const { data, error } = await client
+        .from("shop_memberships")
+        .select("user_id, role, status")
+        .eq("shop_id", resolvedShopId)
+        .order("created_at")
+        .order("user_id");
+      if (error) throw error;
+      availableMembers = (data ?? []) as MemberRow[];
+    }
+
+    return {
+      userId,
+      shops: availableShops,
+      selectedShopId: resolvedShopId,
+      branches: availableBranches,
+      selectedBranchId: resolvedBranchId,
+      members: availableMembers,
+    };
   }, [client, session?.user.id]);
 
+  const applyAuthorizationSnapshot = useCallback((snapshot: AuthorizationSnapshot) => {
+    if (!session?.user.id || snapshot.userId !== session.user.id) return;
+
+    const previousShop = shopsRef.current.find((shop) => shop.id === selectedShopIdRef.current);
+    const nextShop = snapshot.shops.find((shop) => shop.id === snapshot.selectedShopId);
+    const shopContextChanged =
+      selectedShopIdRef.current !== snapshot.selectedShopId ||
+      previousShop?.role !== nextShop?.role;
+
+    setShops((current) => sameShopContexts(current, snapshot.shops) ? current : snapshot.shops);
+    selectedShopIdRef.current = snapshot.selectedShopId;
+    selectedShopUserIdRef.current = snapshot.userId;
+    selectedBranchIdRef.current = snapshot.selectedBranchId;
+    setSelectedShopId(snapshot.selectedShopId);
+    setBranches((current) => sameBranchOptions(current, snapshot.branches) ? current : snapshot.branches);
+    setSelectedBranchId(snapshot.selectedBranchId);
+    setBranchesLoading(false);
+    setShopsForUserId(snapshot.userId);
+    setShopsError("");
+    setBranchesError("");
+    setAuthorizationRefreshing(false);
+    setMembers((current) => sameMemberRows(current, snapshot.members) ? current : snapshot.members);
+    if (shopContextChanged) {
+      setMemberBranchIds([]);
+      setReactivationTargetUserId("");
+      setReactivationBranchIds([]);
+    } else {
+      setMemberBranchIds((current) => {
+        const next = current.filter((branchId) => snapshot.branches.some((branch) => branch.id === branchId));
+        return next.length === current.length ? current : next;
+      });
+      setReactivationBranchIds((current) => {
+        const next = current.filter((branchId) => snapshot.branches.some((branch) => branch.id === branchId));
+        return next.length === current.length ? current : next;
+      });
+      setReactivationTargetUserId((current) => (
+        current && snapshot.members.some((member) =>
+          member.user_id === current && member.status === "suspended" && member.role !== "owner"
+        )
+          ? current
+          : ""
+      ));
+    }
+
+    const savedSelection = readShopBranchSelection(snapshot.userId);
+    if (!snapshot.selectedShopId) {
+      clearShopBranchSelection(snapshot.userId);
+    } else if (
+      savedSelection?.shopId !== snapshot.selectedShopId ||
+      (savedSelection.branchId ?? null) !== (snapshot.selectedBranchId || null)
+    ) {
+      writeShopBranchSelection(snapshot.userId, {
+        shopId: snapshot.selectedShopId,
+        branchId: snapshot.selectedBranchId || null,
+      });
+    }
+  }, [session?.user.id]);
+
+  const authorizationLoaderRef = useRef(loadAuthorizationSnapshot);
+  const authorizationApplierRef = useRef(applyAuthorizationSnapshot);
+  const authorizationErrorHandlerRef = useRef<(error: unknown) => void>(() => undefined);
+  authorizationLoaderRef.current = loadAuthorizationSnapshot;
+  authorizationApplierRef.current = applyAuthorizationSnapshot;
+  authorizationErrorHandlerRef.current = (error) => {
+    if (
+      !activeAuthorizationUserRef.current ||
+      activeAuthorizationUserRef.current !== sessionUserIdRef.current
+    ) return;
+    setShopsError(errorMessage(error, "Could not verify your shop and branch access."));
+    setAuthorizationRefreshing(false);
+  };
+  if (!authorizationRefreshRequestRef.current) {
+    authorizationRefreshRequestRef.current = createAuthorizationRefreshQueue(
+      () => authorizationLoaderRef.current(),
+      (snapshot) => authorizationApplierRef.current(snapshot),
+      (error) => authorizationErrorHandlerRef.current(error),
+      () => Boolean(activeAuthorizationUserRef.current) &&
+        activeAuthorizationUserRef.current === sessionUserIdRef.current,
+    );
+  }
+
   useEffect(() => {
-    let active = true;
-    void loadShops(() => active);
+    if (!client || !session?.user.id) {
+      activeAuthorizationUserRef.current = "";
+      selectedShopIdRef.current = "";
+      selectedShopUserIdRef.current = "";
+      selectedBranchIdRef.current = "";
+      setAuthorizationRefreshing(false);
+      setShops([]);
+      setShopsError("");
+      setShopsForUserId("");
+      setSelectedShopId("");
+      setBranches([]);
+      setBranchesLoading(false);
+      setSelectedBranchId("");
+      setBranchesError("");
+      setMembers([]);
+      return;
+    }
+
+    const userId = session.user.id;
+    if (activeAuthorizationUserRef.current !== userId) {
+      activeAuthorizationUserRef.current = userId;
+      selectedShopIdRef.current = "";
+      selectedShopUserIdRef.current = userId;
+      selectedBranchIdRef.current = "";
+      setShops([]);
+      setShopsForUserId(userId);
+      setSelectedShopId("");
+      setBranches([]);
+      setBranchesLoading(true);
+      setSelectedBranchId("");
+      setMembers([]);
+      setMemberBranchIds([]);
+      setAuthorizationRefreshing(true);
+      setShopsError("");
+      setBranchesError("");
+    }
+
+    const requestRefresh = authorizationRefreshRequestRef.current;
+    if (!requestRefresh) return;
+    void requestRefresh();
+    const unsubscribe = watchAuthorizationChanges(
+      client,
+      userId,
+      () => void requestRefresh(),
+      window,
+      document,
+    );
+
     return () => {
-      active = false;
+      if (activeAuthorizationUserRef.current === userId) activeAuthorizationUserRef.current = "";
+      unsubscribe();
     };
-  }, [loadShops]);
+  }, [client, session?.user.id]);
 
   const selectedShop = useMemo(
     () => shops.find((shop) => shop.id === selectedShopId) ?? null,
     [shops, selectedShopId],
   );
-
-  useEffect(() => {
-    if (!client || !selectedShopId || !session?.user.id) {
-      setBranches([]);
-      setSelectedBranchId("");
-      setBranchesLoading(false);
-      setMembers([]);
-      setBranchesError("");
-      return;
-    }
-
-    let active = true;
-    const userId = session.user.id;
-    setBranchesLoading(true);
-    setBranches([]);
-    setSelectedBranchId("");
-    setMembers([]);
-    setBranchesError("");
-
-    void (async () => {
-      try {
-        const { data, error } = await client
-          .from("branches")
-          .select("id, name, is_primary")
-          .eq("shop_id", selectedShopId)
-          .eq("is_active", true)
-          .order("is_primary", { ascending: false })
-          .order("name");
-
-        if (!active) return;
-        if (error) throw error;
-        const accessibleBranches = (data ?? []).map((branch) => ({
-          id: String(branch.id),
-          name: String(branch.name),
-          is_primary: Boolean(branch.is_primary),
-        }));
-        const savedSelection = readShopBranchSelection(userId);
-        const resolvedBranchId = resolveAuthorizedBranchId(
-          savedSelection,
-          selectedShopId,
-          accessibleBranches.map((branch) => branch.id),
-        );
-        setBranches(accessibleBranches);
-        setSelectedBranchId(resolvedBranchId);
-        writeShopBranchSelection(userId, {
-          shopId: selectedShopId,
-          branchId: resolvedBranchId || null,
-        });
-      } catch (error) {
-        if (active) {
-          setBranchesError(errorMessage(error, "Could not load authorized branches."));
-        }
-      } finally {
-        if (active) setBranchesLoading(false);
-      }
-    })();
-
-    return () => {
-      active = false;
-    };
-  }, [client, selectedShopId, session?.user.id]);
-
-  const [membersRevision, setMembersRevision] = useState(0);
-
-  const loadMembers = useCallback(async (isCurrent: () => boolean) => {
-    if (!client || !selectedShop || selectedShop.role !== "owner") {
-      setMembers([]);
-      return;
-    }
-
-    setMembers([]);
-    try {
-      const { data, error } = await client
-        .from("shop_memberships")
-        .select("user_id, role, status")
-        .eq("shop_id", selectedShop.id)
-        .order("created_at");
-
-      if (!isCurrent()) return;
-      if (error) {
-        setActionError(error.message);
-        return;
-      }
-      setMembers((data ?? []) as MemberRow[]);
-    } catch (error) {
-      if (isCurrent()) {
-        setActionError(errorMessage(error, "Could not load shop memberships."));
-      }
-    }
-  }, [client, selectedShop]);
-
-  useEffect(() => {
-    let active = true;
-    void loadMembers(() => active);
-    return () => {
-      active = false;
-    };
-  }, [loadMembers, membersRevision]);
 
   const handleAuthSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -339,6 +417,7 @@ export default function BackendAuthGate() {
           : await loginWithEmail(client, email, password);
 
       if (response.error) throw response.error;
+      resetPasswordEntry(setPassword, setPasswordVisible);
 
       if (authMode === "register" && !response.data.session) {
         setAuthNotice(
@@ -369,13 +448,18 @@ export default function BackendAuthGate() {
         ...current,
         { id: createdShopId, name: shopName.trim(), role: "owner" },
       ]);
+      selectedShopIdRef.current = createdShopId;
+      selectedShopUserIdRef.current = session?.user.id ?? "";
+      selectedBranchIdRef.current = "";
       setSelectedShopId(createdShopId);
+      setBranchesLoading(true);
       if (session?.user.id) {
         writeShopBranchSelection(session.user.id, {
           shopId: createdShopId,
           branchId: null,
         });
       }
+      void authorizationRefreshRequestRef.current?.();
       setShopName("");
       setActionNotice("Shop created. You are its owner and its primary branch is ready.");
     } catch (error) {
@@ -395,6 +479,7 @@ export default function BackendAuthGate() {
         ...current,
         { id: String(data), name: branchName.trim(), is_primary: false },
       ]);
+      void authorizationRefreshRequestRef.current?.();
       setBranchName("");
       setActionNotice("Branch created. Assign staff access before they can select it.");
     } catch (error) {
@@ -421,7 +506,7 @@ export default function BackendAuthGate() {
       setActionNotice("Member access saved for the selected branches.");
       setReactivationTargetUserId("");
       setReactivationBranchIds([]);
-      setMembersRevision((revision) => revision + 1);
+      void authorizationRefreshRequestRef.current?.();
     } catch (error) {
       setActionError(errorMessage(error, "Could not update member access."));
     }
@@ -435,7 +520,7 @@ export default function BackendAuthGate() {
       const { error } = await suspendMember(client, selectedShop.id, userId);
       if (error) throw error;
       setActionNotice("Membership suspended. Its saved branch access remains blocked until reactivation.");
-      setMembersRevision((revision) => revision + 1);
+      void authorizationRefreshRequestRef.current?.();
     } catch (error) {
       setActionError(errorMessage(error, "Could not suspend that membership."));
     }
@@ -467,7 +552,7 @@ export default function BackendAuthGate() {
       setReactivationTargetUserId("");
       setReactivationBranchIds([]);
       setActionNotice("Membership reactivated with its existing role and branch access.");
-      setMembersRevision((revision) => revision + 1);
+      void authorizationRefreshRequestRef.current?.();
     } catch (error) {
       setActionError(errorMessage(error, "Could not reactivate that member."));
     }
@@ -479,6 +564,10 @@ export default function BackendAuthGate() {
     const { error } = await logout(client);
     if (error) setAuthError(error.message);
     else {
+      resetPasswordEntry(setPassword, setPasswordVisible);
+      selectedShopIdRef.current = "";
+      selectedShopUserIdRef.current = "";
+      selectedBranchIdRef.current = "";
       setSession(null);
       setShops([]);
       setBranches([]);
@@ -599,12 +688,12 @@ export default function BackendAuthGate() {
               </button>
             </div>
 
-            {shopsLoading || shopsForUserId !== session.user.id ? (
-              <p role="status">Loading authorized shops…</p>
-            ) : shopsError ? (
+            {shopsError || branchesError ? (
               <p className="inventory-notice notice-warning" role="status">
-                Shop access is unavailable. Refresh the page to try again; no new shop was created.
+                Authorization could not be verified. Shop and branch tools are unavailable; refresh the page to try again.
               </p>
+            ) : authorizationRefreshing || branchesLoading || shopsForUserId !== session.user.id ? (
+              <p role="status">Refreshing authorized shop and branch access…</p>
             ) : shops.length === 0 ? (
               <form className="operations-form" onSubmit={handleCreateShop}>
                 <p>No active shop membership was found. Create a shop to receive its owner membership.</p>
@@ -622,6 +711,9 @@ export default function BackendAuthGate() {
                     <select value={selectedShopId} onChange={(event) => {
                       const nextShopId = event.target.value;
                       if (nextShopId && !shops.some((shop) => shop.id === nextShopId)) return;
+                      selectedShopIdRef.current = nextShopId;
+                      selectedShopUserIdRef.current = session?.user.id ?? "";
+                      selectedBranchIdRef.current = "";
                       setSelectedShopId(nextShopId);
                       setSelectedBranchId("");
                       setBranches([]);
@@ -641,6 +733,7 @@ export default function BackendAuthGate() {
                       } else if (session?.user.id) {
                         clearShopBranchSelection(session.user.id);
                       }
+                      if (nextShopId) void authorizationRefreshRequestRef.current?.();
                     }}>
                       <option value="">Choose a business</option>
                       {shops.map((shop) => <option value={shop.id} key={shop.id}>{shop.name} · {roleLabels[shop.role]}</option>)}
@@ -654,6 +747,7 @@ export default function BackendAuthGate() {
                         onChange={(event) => {
                           const nextBranchId = event.target.value;
                           if (nextBranchId && !branches.some((branch) => branch.id === nextBranchId)) return;
+                          selectedBranchIdRef.current = nextBranchId;
                           setSelectedBranchId(nextBranchId);
                           if (session?.user.id && shops.some((shop) => shop.id === selectedShopId)) {
                             writeShopBranchSelection(session.user.id, {
@@ -661,6 +755,7 @@ export default function BackendAuthGate() {
                               branchId: nextBranchId || null,
                             });
                           }
+                          void authorizationRefreshRequestRef.current?.();
                         }}
                         disabled={branchesLoading || branches.length === 0}
                       >

@@ -1,7 +1,7 @@
 begin;
 
 create extension if not exists pgtap with schema extensions;
-select plan(59);
+select plan(71);
 
 insert into auth.users (
   id, aud, role, email, encrypted_password, email_confirmed_at,
@@ -12,7 +12,8 @@ insert into auth.users (
   ('10000000-0000-4000-8000-000000000003', 'authenticated', 'authenticated', 'owner-b@example.test', '', now(), '{}'::jsonb, '{}'::jsonb, now(), now()),
   ('10000000-0000-4000-8000-000000000004', 'authenticated', 'authenticated', 'new-member@example.test', '', now(), '{}'::jsonb, '{}'::jsonb, now(), now()),
   ('10000000-0000-4000-8000-000000000005', 'authenticated', 'authenticated', 'new-owner@example.test', '', now(), '{}'::jsonb, '{}'::jsonb, now(), now()),
-  ('10000000-0000-4000-8000-000000000006', 'authenticated', 'authenticated', 'manager-a@example.test', '', now(), '{}'::jsonb, '{}'::jsonb, now(), now());
+  ('10000000-0000-4000-8000-000000000006', 'authenticated', 'authenticated', 'manager-a@example.test', '', now(), '{}'::jsonb, '{}'::jsonb, now(), now()),
+  ('10000000-0000-4000-8000-000000000007', 'authenticated', 'authenticated', 'inventory-a@example.test', '', now(), '{}'::jsonb, '{}'::jsonb, now(), now());
 
 insert into public.shops (id, name, created_by) values
   ('20000000-0000-4000-8000-000000000001', 'Fictional Shop A', '10000000-0000-4000-8000-000000000001'),
@@ -22,16 +23,20 @@ insert into public.shop_memberships (shop_id, user_id, role, created_by) values
   ('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000001', 'owner', '10000000-0000-4000-8000-000000000001'),
   ('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000002', 'sales_staff', '10000000-0000-4000-8000-000000000001'),
   ('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000006', 'manager', '10000000-0000-4000-8000-000000000001'),
+  ('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000007', 'inventory_staff', '10000000-0000-4000-8000-000000000001'),
   ('20000000-0000-4000-8000-000000000002', '10000000-0000-4000-8000-000000000003', 'owner', '10000000-0000-4000-8000-000000000003');
 
-insert into public.branches (id, shop_id, name, is_primary, created_by) values
-  ('30000000-0000-4000-8000-000000000001', '20000000-0000-4000-8000-000000000001', 'A Main', true, '10000000-0000-4000-8000-000000000001'),
-  ('30000000-0000-4000-8000-000000000002', '20000000-0000-4000-8000-000000000001', 'A Restricted', false, '10000000-0000-4000-8000-000000000001'),
-  ('30000000-0000-4000-8000-000000000003', '20000000-0000-4000-8000-000000000002', 'B Main', true, '10000000-0000-4000-8000-000000000003');
+insert into public.branches (id, shop_id, name, is_primary, is_active, created_by) values
+  ('30000000-0000-4000-8000-000000000001', '20000000-0000-4000-8000-000000000001', 'A Main', true, true, '10000000-0000-4000-8000-000000000001'),
+  ('30000000-0000-4000-8000-000000000002', '20000000-0000-4000-8000-000000000001', 'A Restricted', false, true, '10000000-0000-4000-8000-000000000001'),
+  ('30000000-0000-4000-8000-000000000003', '20000000-0000-4000-8000-000000000002', 'B Main', true, true, '10000000-0000-4000-8000-000000000003'),
+  ('30000000-0000-4000-8000-000000000004', '20000000-0000-4000-8000-000000000001', 'A Inactive', false, false, '10000000-0000-4000-8000-000000000001');
 
 insert into public.branch_memberships (shop_id, branch_id, user_id, created_by) values
   ('20000000-0000-4000-8000-000000000001', '30000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000002', '10000000-0000-4000-8000-000000000001'),
-  ('20000000-0000-4000-8000-000000000001', '30000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000006', '10000000-0000-4000-8000-000000000001');
+  ('20000000-0000-4000-8000-000000000001', '30000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000006', '10000000-0000-4000-8000-000000000001'),
+  ('20000000-0000-4000-8000-000000000001', '30000000-0000-4000-8000-000000000004', '10000000-0000-4000-8000-000000000002', '10000000-0000-4000-8000-000000000001'),
+  ('20000000-0000-4000-8000-000000000001', '30000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000007', '10000000-0000-4000-8000-000000000001');
 
 set local role authenticated;
 select set_config('request.jwt.claim.sub', '10000000-0000-4000-8000-000000000002', true);
@@ -118,6 +123,18 @@ select is(
   0,
   'staff cannot read a branch in another shop'
 );
+select ok(
+  not private.can_access_branch('20000000-0000-4000-8000-000000000001', '30000000-0000-4000-8000-000000000002'),
+  'staff cannot pass an unassigned branch to the authorization helper'
+);
+select ok(
+  not private.can_access_branch('20000000-0000-4000-8000-000000000001', '30000000-0000-4000-8000-000000000003'),
+  'staff cannot pass a cross-shop branch to the authorization helper'
+);
+select ok(
+  not private.can_access_branch('20000000-0000-4000-8000-000000000001', '30000000-0000-4000-8000-000000000004'),
+  'an assigned but inactive branch is denied by the authorization helper'
+);
 select throws_ok(
   $$ update public.shop_memberships set role = 'owner' where shop_id = '20000000-0000-4000-8000-000000000001' and user_id = '10000000-0000-4000-8000-000000000002' $$,
   '42501', null,
@@ -132,6 +149,18 @@ select throws_ok(
   $$ select public.owner_set_member_access('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000004', 'inventory_staff', array['30000000-0000-4000-8000-000000000001']::uuid[]) $$,
   '42501', null,
   'staff cannot use the owner membership function'
+);
+
+select set_config('request.jwt.claim.sub', '10000000-0000-4000-8000-000000000007', true);
+select throws_ok(
+  $$ select public.owner_set_member_access('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000004', 'sales_staff', array['30000000-0000-4000-8000-000000000001']::uuid[]) $$,
+  '42501', null,
+  'inventory staff cannot execute the owner member-assignment function'
+);
+select throws_ok(
+  $$ select public.owner_reactivate_shop_member('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000004') $$,
+  '42501', null,
+  'inventory staff cannot execute the owner reactivation function'
 );
 
 select set_config('request.jwt.claim.sub', '10000000-0000-4000-8000-000000000006', true);
@@ -173,6 +202,11 @@ select throws_ok(
   '42501', null,
   'anonymous users cannot execute shop onboarding'
 );
+select throws_ok(
+  $$ select public.owner_reactivate_shop_member('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000004') $$,
+  '42501', null,
+  'anonymous users cannot execute member reactivation'
+);
 
 reset role;
 set local role authenticated;
@@ -181,6 +215,14 @@ select is(
   (select count(*)::integer from public.branches where shop_id = '20000000-0000-4000-8000-000000000001'),
   2,
   'owner can read all active branches in their shop'
+);
+select ok(
+  not private.can_access_branch('20000000-0000-4000-8000-000000000001', '30000000-0000-4000-8000-000000000003'),
+  'owner cannot pass a branch from another shop to the authorization helper'
+);
+select ok(
+  not private.can_access_branch('20000000-0000-4000-8000-000000000001', '30000000-0000-4000-8000-000000000004'),
+  'owner cannot access an inactive branch through the authorization helper'
 );
 select results_eq(
   $$ with changed as (
@@ -229,6 +271,11 @@ select throws_ok(
   '22023', null,
   'owner cannot assign a branch from another shop'
 );
+select throws_ok(
+  $$ select public.owner_set_member_access('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000004', 'manager', array['30000000-0000-4000-8000-000000000004']::uuid[]) $$,
+  '22023', null,
+  'owner cannot assign an inactive branch'
+);
 select lives_ok(
   $$ select public.owner_suspend_shop_member(
     '20000000-0000-4000-8000-000000000001',
@@ -257,6 +304,10 @@ select is(
   0,
   'suspended member cannot read their previously assigned branch'
 );
+select ok(
+  not private.can_access_branch('20000000-0000-4000-8000-000000000001', '30000000-0000-4000-8000-000000000002'),
+  'suspended membership is rejected by the branch authorization helper'
+);
 select set_config('request.jwt.claim.sub', '10000000-0000-4000-8000-000000000001', true);
 select is(
   (select count(*)::integer from public.shop_memberships where shop_id = '20000000-0000-4000-8000-000000000001' and user_id = '10000000-0000-4000-8000-000000000004' and status = 'suspended'),
@@ -266,9 +317,10 @@ select is(
 select lives_ok(
   $$ select public.owner_reactivate_shop_member(
     '20000000-0000-4000-8000-000000000001',
-    '10000000-0000-4000-8000-000000000004'
+    '10000000-0000-4000-8000-000000000004',
+    array['30000000-0000-4000-8000-000000000001']::uuid[]
   ) $$,
-  'shop owner can reactivate a suspended manager'
+  'shop owner can reactivate a suspended manager without replacing saved access'
 );
 select is(
   (select count(*)::integer from public.shop_memberships where shop_id = '20000000-0000-4000-8000-000000000001' and user_id = '10000000-0000-4000-8000-000000000004' and role = 'manager' and status = 'active'),
@@ -279,6 +331,11 @@ select is(
   (select count(*)::integer from public.branch_memberships where shop_id = '20000000-0000-4000-8000-000000000001' and user_id = '10000000-0000-4000-8000-000000000004' and branch_id = '30000000-0000-4000-8000-000000000002'),
   1,
   'reactivation preserves the existing branch assignment'
+);
+select is(
+  (select count(*)::integer from public.branch_memberships where shop_id = '20000000-0000-4000-8000-000000000001' and user_id = '10000000-0000-4000-8000-000000000004' and branch_id = '30000000-0000-4000-8000-000000000001'),
+  0,
+  'reactivation ignores extra branch IDs when saved access already exists'
 );
 select set_config('request.jwt.claim.sub', '10000000-0000-4000-8000-000000000004', true);
 select is(
@@ -323,6 +380,11 @@ select throws_ok(
   $$ select public.owner_reactivate_shop_member('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000004', array['30000000-0000-4000-8000-000000000003']::uuid[]) $$,
   '22023', null,
   'owner cannot restore a branch from another shop'
+);
+select throws_ok(
+  $$ select public.owner_reactivate_shop_member('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000004', array['30000000-0000-4000-8000-000000000004']::uuid[]) $$,
+  '22023', null,
+  'owner cannot restore an inactive branch for a legacy member'
 );
 select is(
   (select count(*)::integer from public.shop_memberships where shop_id = '20000000-0000-4000-8000-000000000001' and user_id = '10000000-0000-4000-8000-000000000004' and status = 'suspended'),

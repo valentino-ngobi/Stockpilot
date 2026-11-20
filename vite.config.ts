@@ -1,15 +1,16 @@
 import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
-import { isSecretSupabaseKey } from "./src/lib/supabaseKey";
+import { productionBuildConfigurationError } from "./src/lib/supabaseKey";
 
-export default defineConfig(({ mode }) => {
+export default defineConfig(({ mode, command }) => {
   const env = loadEnv(mode, ".", "VITE_");
-  const publishableKey = env.VITE_SUPABASE_PUBLISHABLE_KEY?.trim() ?? "";
-
-  if (isSecretSupabaseKey(publishableKey)) {
-    throw new Error(
-      "A Supabase secret or service-role key cannot be bundled in a browser build. Use a publishable key.",
+  if (command === "build") {
+    const configurationError = productionBuildConfigurationError(
+      env.VITE_SUPABASE_URL,
+      env.VITE_SUPABASE_PUBLISHABLE_KEY,
     );
+
+    if (configurationError) throw new Error(configurationError);
   }
 
   return {

@@ -17,3 +17,21 @@ export function isSecretSupabaseKey(key: string): boolean {
     return false;
   }
 }
+
+export function productionBuildConfigurationError(
+  urlValue: string | undefined,
+  publishableKeyValue: string | undefined,
+): string | null {
+  const url = urlValue?.trim() ?? "";
+  const publishableKey = publishableKeyValue?.trim() ?? "";
+
+  if (!url || !publishableKey) {
+    return "Production builds require VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY.";
+  }
+
+  if (isSecretSupabaseKey(publishableKey)) {
+    return "A Supabase secret or service-role key cannot be used in a browser build. Use a publishable key.";
+  }
+
+  return null;
+}

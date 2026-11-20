@@ -1,18 +1,39 @@
 import { isSecretSupabaseKey } from "./supabaseKey";
 
+export { productionBuildConfigurationError } from "./supabaseKey";
+
 export type SupabaseConfiguration =
   | { mode: "prototype" }
   | { mode: "invalid"; message: string }
   | { mode: "configured"; url: string; publishableKey: string };
 
+export type SupabaseConfigurationEnvironment = {
+  isDevelopment: boolean;
+  prototypeEnabled: boolean;
+};
+
 export function resolveSupabaseConfiguration(
   urlValue: string | undefined,
   publishableKeyValue: string | undefined,
+  environment: SupabaseConfigurationEnvironment = {
+    isDevelopment: false,
+    prototypeEnabled: false,
+  },
 ): SupabaseConfiguration {
   const url = urlValue?.trim() ?? "";
   const publishableKey = publishableKeyValue?.trim() ?? "";
 
-  if (!url && !publishableKey) return { mode: "prototype" };
+  if (!url && !publishableKey) {
+    if (environment.isDevelopment && environment.prototypeEnabled) {
+      return { mode: "prototype" };
+    }
+
+    return {
+      mode: "invalid",
+      message:
+        "Supabase configuration is required. Local prototype mode must be explicitly enabled during development.",
+    };
+  }
 
   if (!url || !publishableKey) {
     return {

@@ -5,13 +5,17 @@ import {
   createShopForCurrentUser,
   loginWithEmail,
   logout,
+  logoutEverywhere,
   reactivateMember,
   registerWithEmail,
   restoreSession,
   setMemberAccess,
   suspendMember,
 } from "./auth";
-import { resolveSupabaseConfiguration } from "./supabaseConfig";
+import {
+  productionBuildConfigurationError,
+  resolveSupabaseConfiguration,
+} from "./supabaseConfig";
 
 function createClientMock() {
   const client = {
@@ -28,10 +32,34 @@ function createClientMock() {
 }
 
 describe("Supabase configuration mode", () => {
-  it("keeps the prototype mode when neither setting is present", () => {
-    expect(resolveSupabaseConfiguration(undefined, undefined)).toEqual({
-      mode: "prototype",
-    });
+  it("fails closed when production configuration is missing", () => {
+    expect(resolveSupabaseConfiguration(undefined, undefined).mode).toBe("invalid");
+    expect(productionBuildConfigurationError(undefined, undefined)).toContain(
+      "Production builds require",
+    );
+  });
+
+  it("allows the LocalStorage prototype only when explicitly enabled in development", () => {
+    expect(
+      resolveSupabaseConfiguration(undefined, undefined, {
+        isDevelopment: true,
+        prototypeEnabled: true,
+      }),
+    ).toEqual({ mode: "prototype" });
+
+    expect(
+      resolveSupabaseConfiguration(undefined, undefined, {
+        isDevelopment: false,
+        prototypeEnabled: true,
+      }).mode,
+    ).toBe("invalid");
+
+    expect(
+      resolveSupabaseConfiguration(undefined, undefined, {
+        isDevelopment: true,
+        prototypeEnabled: false,
+      }).mode,
+    ).toBe("invalid");
   });
 
   it("fails closed when only one setting is present", () => {
@@ -47,6 +75,9 @@ describe("Supabase configuration mode", () => {
     expect(
       resolveSupabaseConfiguration("https://example.supabase.co", serviceRoleJwt).mode,
     ).toBe("invalid");
+    expect(
+      productionBuildConfigurationError("https://example.supabase.co", serviceRoleJwt),
+    ).toContain("secret or service-role key");
   });
 
   it("accepts a complete HTTPS configuration", () => {
@@ -105,7 +136,12 @@ describe("authentication and tenant service calls", () => {
 
   it("logs out through Supabase Auth", () => {
     logout(client);
-    expect(client.auth.signOut).toHaveBeenCalledOnce();
+    expect(client.auth.signOut).toHaveBeenCalledWith({ scope: "local" });
+  });
+
+  it("keeps global sign-out available as a separate explicit action", () => {
+    logoutEverywhere(client);
+    expect(client.auth.signOut).toHaveBeenCalledWith({ scope: "global" });
   });
 
   it("creates a shop only through the owner-onboarding RPC", () => {

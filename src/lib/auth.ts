@@ -31,7 +31,11 @@ export function restoreSession(client: SupabaseClient) {
 }
 
 export function logout(client: SupabaseClient) {
-  return client.auth.signOut();
+  return client.auth.signOut({ scope: "local" });
+}
+
+export function logoutEverywhere(client: SupabaseClient) {
+  return client.auth.signOut({ scope: "global" });
 }
 
 export function createShopForCurrentUser(
