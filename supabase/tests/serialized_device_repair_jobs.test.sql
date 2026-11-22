@@ -190,11 +190,29 @@ select ok(
 -- Owner creates a zero-cost repair; retries return one durable job and reserve once.
 select set_config('request.jwt.claim.sub', 'd9000000-0000-4000-8000-000000000001', true);
 set local role authenticated;
+select throws_ok(
+  $$ select public.create_repair_job(
+       'd9100000-0000-4000-8000-000000000001', 'd9200000-0000-4000-8000-000000000001',
+       'd9500000-0000-4000-8000-000000000001', null,
+       'Synthetic warranty privacy check', 'Synthetic intake condition', null,
+       '{"supplier_invoice":{"amount":"999.00","currency":"USD"}}'::jsonb,
+       'repair-warranty-financial-evidence-01'
+     ) $$,
+  '23514', null, 'repair creation rejects nested financial warranty evidence'
+);
+reset role;
+select is(
+  (select count(*) from public.repair_operations
+   where idempotency_key = 'repair-warranty-financial-evidence-01'),
+  0::bigint, 'rejected warranty evidence leaves no repair operation residue'
+);
+set local role authenticated;
 select lives_ok(
   $$ insert into repair_test_results (name, job_id) values ('zero', public.create_repair_job(
        'd9100000-0000-4000-8000-000000000001', 'd9200000-0000-4000-8000-000000000001',
        'd9500000-0000-4000-8000-000000000001', null,
-       'Synthetic screen repair', 'Synthetic intake condition', null, '{}'::jsonb,
+       'Synthetic screen repair', 'Synthetic intake condition', null,
+       '{"provider":"Synthetic Warranty Provider","coverage_status":"active"}'::jsonb,
        'repair-zero-create-01'
      )) $$,
   'Owner can create a repair for an available known-zero device'
@@ -203,7 +221,8 @@ select is(
   public.create_repair_job(
     'd9100000-0000-4000-8000-000000000001', 'd9200000-0000-4000-8000-000000000001',
     'd9500000-0000-4000-8000-000000000001', null,
-    'Synthetic screen repair', 'Synthetic intake condition', null, '{}'::jsonb,
+    'Synthetic screen repair', 'Synthetic intake condition', null,
+    '{"provider":"Synthetic Warranty Provider","coverage_status":"active"}'::jsonb,
     'repair-zero-create-01'
   ),
   (select job_id from repair_test_results where name = 'zero'),
@@ -464,11 +483,42 @@ select lives_ok(
   $$ select public.update_repair_diagnosis(
        'd9100000-0000-4000-8000-000000000001',
        (select job_id from repair_test_results where name = 'zero'), 3,
-       'Synthetic board diagnosis', 'diagnosing', '{"evidence":"synthetic-test"}'::jsonb,
+       'Synthetic board diagnosis', 'diagnosing',
+       '{"technician_notes":"Synthetic diagnosis evidence"}'::jsonb,
        'repair-diagnosis-01'
      ) $$,
   'assigned Inventory Staff can record diagnosis and progress state'
 );
+select throws_ok(
+  $$ select public.update_repair_progress(
+       'd9100000-0000-4000-8000-000000000001',
+       (select job_id from repair_test_results where name = 'zero'), 4,
+       'Synthetic progress with structured invoice data', 'in_progress',
+       '{"supplier_invoice":{"amount":"999.00","currency":"USD"}}'::jsonb,
+       'repair-progress-financial-evidence-01'
+     ) $$,
+  '23514', null, 'database rejects nested financial data in staff-readable progress evidence'
+);
+select throws_ok(
+  $$ select public.update_repair_progress(
+       'd9100000-0000-4000-8000-000000000001',
+       (select job_id from repair_test_results where name = 'zero'), 4,
+       'Synthetic progress with an unknown evidence key', 'in_progress',
+       '{"invoice_total":"999.00"}'::jsonb,
+       'repair-progress-unknown-evidence-01'
+     ) $$,
+  '23514', null, 'database rejects unknown operational evidence keys'
+);
+reset role;
+select is(
+  (select count(*) from public.repair_operations
+   where idempotency_key in (
+     'repair-progress-financial-evidence-01',
+     'repair-progress-unknown-evidence-01'
+   )),
+  0::bigint, 'rejected progress evidence leaves no operation or audit residue'
+);
+set local role authenticated;
 select throws_ok(
   $$ select public.submit_repair_estimate(
        'd9100000-0000-4000-8000-000000000001',
